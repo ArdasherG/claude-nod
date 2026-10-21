@@ -703,7 +703,13 @@ def parse_text(message, chat_id):
     if not text:
         return None
     reply = (message.get("reply_to_message") or {}).get("message_id")
-    return {"ts": time.time(), "text": text,
+    # Время отправки, а не получения: иначе сообщение, написанное до того, как
+    # мы начали ждать, подхватится следующим ожиданием как свежий ответ.
+    try:
+        sent_at = float(message.get("date") or 0) or time.time()
+    except (TypeError, ValueError):
+        sent_at = time.time()
+    return {"ts": sent_at, "text": text,
             "message_id": message.get("message_id"), "reply_to": reply}
 
 
@@ -769,8 +775,10 @@ def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
                     parsed = parse_text(message, chat_id)
                     if not parsed:
                         continue
-                    if want_text and mine_text is None and (
-                            not reply_to or parsed.get("reply_to") in (None, reply_to)):
+                    if (want_text and mine_text is None
+                            and parsed.get("ts", 0) >= since - 1
+                            and (not reply_to
+                                 or parsed.get("reply_to") in (None, reply_to))):
                         mine_text = parsed
                     else:
                         inbox_put(parsed)

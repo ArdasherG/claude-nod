@@ -17,6 +17,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tg_common as tg                                            # noqa: E402
@@ -152,10 +153,15 @@ def main():
     head = "✅ <b>%s</b> — Claude закончил в %s" % (
         tg.esc(project), time.strftime("%H:%M"))
     body = tg.md_to_html(answer) if answer else "<i>ответ пустой</i>"
-    tail = ""
+    tail, keyboard = "", None
+    rid = uuid.uuid4().hex[:8]
     if can_ask:
         tail = ("\n\n💬 <b>Ответьте на это сообщение</b>, чтобы Claude продолжил "
-                "(жду %d с). Продолжение %d из %d." % (wait_for, done + 1, max_followups))
+                "(жду %d с). Продолжение %d из %d."
+                % (wait_for, done + 1, max_followups))
+        # Кнопка нужна, чтобы длинное окно ожидания ничего не стоило: если
+        # продолжать не надо, одно нажатие — и ход завершается сразу.
+        keyboard = [[{"text": "⏹ Не жди меня", "callback_data": "n:%s" % rid}]]
 
     stickers = tg.load_stickers()
     smode = tg.sticker_mode(env, stickers)
@@ -163,7 +169,8 @@ def main():
                smode, quiet=quiet, stickers=stickers)
 
     try:
-        sent = tg.send_parts(token, chat_id, head + "\n" + body + tail, quiet=quiet)
+        sent = tg.send_parts(token, chat_id, head + "\n" + body + tail,
+                             keyboard=keyboard, quiet=quiet)
     except tg.TgFail as exc:
         tg.debug("уведомление не отправлено: %s" % exc)
         tg.log({"tool": HOOK_EVENT, "session": session_id, "via": "notify_failed",
@@ -180,7 +187,16 @@ def main():
     message_id = (sent or {}).get("message_id")
     tg.prepare_state_dir()
     kind, data = tg.wait(token, chat_id, time.time() + wait_for,
-                         want_text=True, reply_to=message_id)
+                         rid=rid, want_text=True, reply_to=message_id)
+    if kind == "press":
+        # Нажали «Не жди меня» — завершаем ход сразу, не тратя окно впустую.
+        tg.answer_press(token, data.get("callback_id"), "Хорошо, не жду")
+        tg.edit(token, data.get("chat_id") or chat_id, data.get("message_id"),
+                head + "\n" + body + "\n\n⏹ <i>Продолжение не нужно</i>")
+        set_followup_count(session_id, 0)
+        tg.log({"tool": HOOK_EVENT, "session": session_id, "cwd": cwd,
+                "via": "notify_dismissed", "chars": len(answer)})
+        return
     if kind != "text":
         set_followup_count(session_id, 0)          # пауза — бюджет обновляется
         tg.log({"tool": HOOK_EVENT, "session": session_id, "cwd": cwd,

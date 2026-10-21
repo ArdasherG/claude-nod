@@ -296,6 +296,18 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(parsed["text"], "причина")
         self.assertEqual(parsed["reply_to"], 7)
 
+    def test_text_uses_sent_time_not_received(self):
+        """Иначе сообщение, написанное до начала ожидания, подхватится как ответ."""
+        long_ago = time.time() - 3600
+        parsed = tg.parse_text(
+            {"from": {"id": "111"}, "text": "старое", "date": long_ago}, "111")
+        self.assertAlmostEqual(parsed["ts"], long_ago, delta=1)
+        self.assertLess(parsed["ts"], time.time() - 60)
+
+    def test_text_without_date_falls_back_to_now(self):
+        parsed = tg.parse_text({"from": {"id": "111"}, "text": "без даты"}, "111")
+        self.assertAlmostEqual(parsed["ts"], time.time(), delta=5)
+
     def test_text_from_stranger_or_empty(self):
         self.assertIsNone(tg.parse_text({"from": {"id": "999"}, "text": "x"}, "111"))
         self.assertIsNone(tg.parse_text({"from": {"id": "111"}, "text": "  "}, "111"))
