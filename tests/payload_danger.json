@@ -1,0 +1,16 @@
+{
+  "session_id": "test-sticker-run",
+  "transcript_path": "C:\\Users\\Neo\\.claude\\projects\\test\\transcript.jsonl",
+  "cwd": "C:\\Users\\Neo\\Desktop\\Python\\projects\\Cou-cou analog",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "rm -rf build",
+    "description": "Удалить папку сборки"
+  },
+  "tool_use_id": "toolu_test_bash_1",
+  "permission_context": {
+    "reason": "Команда изменяет удалённый репозиторий"
+  }
+}

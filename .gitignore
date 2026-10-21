@@ -1,5 +1,12 @@
+# Секреты и локальное состояние
 .env
+stickers.json
 decisions.jsonl
+
+# Исходные листы со стикерами — тяжёлые, в репозитории лежит только нарезка
+stiker_pack/*.png
+!stiker_pack/ready/
+
 *.log
 __pycache__/
 *.pyc

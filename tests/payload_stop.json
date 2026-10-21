@@ -1,0 +1,6 @@
+{
+  "session_id": "test-followup",
+  "hook_event_name": "Stop",
+  "cwd": "C:\\Users\\Neo\\Desktop\\Python\\projects\\Cou-cou analog",
+  "last_assistant_message": "## Готово\n\nСобрал **три** вещи и поправил `safelist.txt`:\n\n- нарезал лист на 23 стикера\n- залил их в Telegram\n- обновил README\n\n```python\ndef pic(name):\n    return name if name in table else None\n```\n\n| файл | строк |\n|---|---|\n| tg_common.py | 520 |\n| tg_approve.py | 480 |\n\nЧто дальше — скажи сам."
+}

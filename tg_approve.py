@@ -2,44 +2,35 @@
 """Хук Claude Code на событие PermissionRequest: спрашивает разрешение в Telegram.
 
 Как работает:
-  Claude Code запускает этот скрипт и передаёт ему на вход (stdin) описание запроса.
-  Скрипт отправляет сообщение в Telegram с кнопками и ждёт нажатия.
-  Нажали «Разрешить» — печатает решение allow, «Запретить» — deny.
+  Claude Code запускает этот скрипт и передаёт ему на вход (stdin) описание
+  запроса. Скрипт отправляет сообщение в Telegram с кнопками и ждёт нажатия.
+  «Разрешить» — печатает решение allow, «Запретить» — deny.
   Ничего не напечатал — Claude Code задаст обычный вопрос в терминале.
 
 Главный принцип: любая ошибка и любой таймаут = пустой вывод и код выхода 0.
 Claude Code не должен зависнуть или сломаться ни при каком раскладе.
 """
-import html
 import json
 import os
 import re
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
-from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-LOG_PATH = HERE / "decisions.jsonl"
-STATE_DIR = Path(
-    os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp"
-) / "cc-tg-approve"
-LOCK_PATH = STATE_DIR / "poll.lock"
-OFFSET_PATH = STATE_DIR / "offset.txt"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tg_common as tg                                            # noqa: E402
 
-WAIT_TIMEOUT = 300      # сколько всего ждём нажатия, секунд
-WATCHDOG_EXTRA = 20     # страховочный таймер = ожидание + столько
-LONG_POLL = 20          # максимум секунд на один вопрос к Telegram
-LOCK_STALE = 60         # через столько секунд брошенный флажок снимается
-MAILBOX_TTL = 600       # через столько секунд чужие нажатия вычищаются
-MAX_FIELD = 500         # обрезка команды/параметров в сообщении
-MAX_TEXT = 3500         # обрезка всего сообщения (лимит Telegram — 4096)
-
-DEBUG = False
 HOOK_EVENT = "PermissionRequest"
+WAIT_DEFAULT = 300      # сколько всего ждём нажатия, секунд
+WATCHDOG_EXTRA = 20     # страховочный таймер = ожидание + столько
+REASON_WAIT = 120       # сколько ждём текст причины после кнопки «с причиной»
+MAX_FIELD = 500         # обрезка команды и параметров в сообщении
+
+_TOKEN = ""             # заполняются в main(), чтобы pic() был коротким
+_CHAT = ""
+_SMODE = "off"
+_STICKERS = {}
 
 FILE_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit", "Read")
 SHELL_TOOLS = ("Bash", "PowerShell", "BashOutput")
@@ -56,166 +47,125 @@ DANGEROUS_HEADS = (
 
 
 # --------------------------------------------------------------------------- #
-# Мелкие утилиты: ни одна из них не должна бросить исключение наружу
+# Разбор запроса
 # --------------------------------------------------------------------------- #
 
-def debug(msg):
-    if DEBUG:
-        sys.stderr.write("[tg_approve] %s\n" % msg)
-        sys.stderr.flush()
+def pic(name, quiet=False, mode=None):
+    """Отправляет стикер события. Молча ничего не делает, если он не задан."""
+    tg.sticker(_TOKEN, _CHAT, name, mode or _SMODE, quiet=quiet,
+               stickers=_STICKERS)
 
 
-def log(record):
-    """Дописывает строку в журнал решений. Молча игнорирует любые проблемы."""
+def sticker_for_request(tool_name, tool_input):
+    """Какой стикер показать перед вопросом."""
+    if tool_name in SHELL_TOOLS:
+        command = str(tool_input.get("command") or "").strip()
+        head = (command.split() or [""])[0].lower().rsplit(".", 1)[0]
+        # curl/wget тоже попадают сюда: они в списке опасных, и это сознательно —
+        # «осторожно» важнее, чем «это про сеть».
+        if head in DANGEROUS_HEADS:
+            return "ask_danger"
+        return "ask_bash"
+    if tool_name in ("Edit", "MultiEdit", "NotebookEdit"):
+        return "ask_edit"
+    if tool_name == "Write":
+        return "ask_write"
+    if tool_name in ("WebFetch", "WebSearch"):
+        return "ask_net"
+    return "ask_other"
+
+
+def tool_detail(tool_name, tool_input):
+    """Главное, что нужно знать о запросе: команда, путь или параметры."""
+    if tool_name in SHELL_TOOLS:
+        return str(tool_input.get("command") or "")
+    for field in ("file_path", "notebook_path", "url", "pattern", "path", "query"):
+        if tool_input.get(field):
+            return str(tool_input[field])
     try:
-        record["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        with open(LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as exc:
-        debug("не удалось записать журнал: %s" % exc)
+        return json.dumps(tool_input, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(tool_input)
 
 
-def read_env():
-    """Настройки: сначала .env рядом со скриптом, потом переменные окружения."""
-    data = {}
-    try:
-        path = HERE / ".env"
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                data[key.strip()] = value.strip()
-    except Exception as exc:
-        debug("не удалось прочитать .env: %s" % exc)
-    for key in ("TG_TOKEN", "TG_CHAT_ID", "CC_TG_TIMEOUT", "CC_TG_DEBUG"):
-        if os.environ.get(key):
-            data[key] = os.environ[key].strip()
-    return data
-
-
-def clip(text, limit=MAX_FIELD):
-    text = str(text)
-    return text if len(text) <= limit else text[:limit] + " …"
-
-
-# --------------------------------------------------------------------------- #
-# Общение с Telegram
-# --------------------------------------------------------------------------- #
-
-class TgFail(Exception):
-    def __init__(self, code=0, detail=""):
-        super().__init__(detail or str(code))
-        self.code = code
-
-
-def api(token, method, payload, timeout=30):
-    """Вызов метода Telegram. При любой неудаче поднимает TgFail."""
-    url = "https://api.telegram.org/bot%s/%s" % (token, method)
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            answer = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise TgFail(exc.code, "%s -> HTTP %s" % (method, exc.code))
-    except Exception as exc:
-        raise TgFail(0, "%s -> %s" % (method, exc))
-    if not answer.get("ok"):
-        raise TgFail(0, "%s -> %s" % (method, answer.get("description")))
-    return answer.get("result")
-
-
-# --------------------------------------------------------------------------- #
-# Текст сообщения
-# --------------------------------------------------------------------------- #
-
-def preview(text, lines=15):
-    """Первые N строк текста для вставки в сообщение."""
-    all_lines = str(text).splitlines()
-    out = "\n".join(all_lines[:lines])
-    if len(all_lines) > lines:
-        out += "\n…"
-    return clip(out, 900)
+def session_key(tool_name, tool_input):
+    """Ключ для кэша «разрешить до конца сессии»."""
+    detail = re.sub(r"\s+", " ", tool_detail(tool_name, tool_input)).strip()
+    return "%s|%s" % (tool_name, detail.lower())
 
 
 def describe(tool_name, tool_input):
     """Человекочитаемое описание запроса: список готовых строк в HTML."""
-    esc = html.escape
     rows = []
 
     if tool_name in SHELL_TOOLS and tool_input.get("command"):
-        rows.append("<pre>%s</pre>" % esc(clip(tool_input["command"])))
+        rows.append("<pre>%s</pre>" % tg.esc(tg.clip(tool_input["command"], MAX_FIELD)))
         if tool_input.get("description"):
-            rows.append("💬 <i>%s</i>" % esc(clip(tool_input["description"], 200)))
+            rows.append("💬 <i>%s</i>"
+                        % tg.esc(tg.clip(tool_input["description"], 200)))
 
     elif tool_name in ("Edit", "MultiEdit"):
-        rows.append("📄 <code>%s</code>" % esc(str(tool_input.get("file_path", "?"))))
+        rows.append("📄 <code>%s</code>"
+                    % tg.esc(str(tool_input.get("file_path", "?"))))
         edits = tool_input.get("edits") or [tool_input]
         for edit in edits[:3]:
             if not isinstance(edit, dict):
                 continue
             if edit.get("old_string"):
-                rows.append("было:\n<pre>%s</pre>" % esc(preview(edit["old_string"], 8)))
+                rows.append("было:\n<pre>%s</pre>"
+                            % tg.esc(tg.clip(tg.head_lines(edit["old_string"], 8), 900)))
             if edit.get("new_string"):
-                rows.append("станет:\n<pre>%s</pre>" % esc(preview(edit["new_string"], 8)))
+                rows.append("станет:\n<pre>%s</pre>"
+                            % tg.esc(tg.clip(tg.head_lines(edit["new_string"], 8), 900)))
         if len(edits) > 3:
             rows.append("<i>…и ещё %d правок</i>" % (len(edits) - 3))
 
     elif tool_name == "Write":
-        rows.append("📄 <code>%s</code>" % esc(str(tool_input.get("file_path", "?"))))
+        rows.append("📄 <code>%s</code>"
+                    % tg.esc(str(tool_input.get("file_path", "?"))))
         if tool_input.get("content"):
             rows.append("содержимое:\n<pre>%s</pre>"
-                        % esc(preview(tool_input["content"], 15)))
+                        % tg.esc(tg.clip(tg.head_lines(tool_input["content"], 15), 900)))
 
     elif tool_name in ("Read", "NotebookEdit", "Glob", "Grep"):
-        target = (
-            tool_input.get("file_path")
-            or tool_input.get("notebook_path")
-            or tool_input.get("pattern")
-            or tool_input.get("path")
-            or "?"
-        )
-        rows.append("📄 <code>%s</code>" % esc(str(target)))
+        rows.append("📄 <code>%s</code>"
+                    % tg.esc(tool_detail(tool_name, tool_input)))
 
     elif tool_name in ("WebFetch", "WebSearch"):
         rows.append("🌐 <code>%s</code>"
-                    % esc(str(tool_input.get("url") or tool_input.get("query") or "?")))
+                    % tg.esc(tool_detail(tool_name, tool_input)))
 
     if not rows:
-        try:
-            dump = json.dumps(tool_input, ensure_ascii=False)
-        except Exception:
-            dump = str(tool_input)
-        rows.append("<pre>%s</pre>" % esc(clip(dump)))
-
+        rows.append("<pre>%s</pre>"
+                    % tg.esc(tg.clip(tool_detail(tool_name, tool_input), MAX_FIELD)))
     return rows
 
 
-def build_text(payload, rule_label=None):
-    esc = html.escape
+def build_text(payload, rid, rule_label=None):
+    """Текст сообщения. Номер запроса показываем, чтобы отличать похожие."""
     cwd = str(payload.get("cwd") or "")
     project = os.path.basename(cwd.rstrip("\\/")) or cwd or "проект"
     tool_name = str(payload.get("tool_name") or "?")
     tool_input = payload.get("tool_input") or {}
     if not isinstance(tool_input, dict):
         tool_input = {"value": tool_input}
+    session = str(payload.get("session_id") or "")[:4]
 
-    rows = ["🔔 <b>%s</b>" % esc(project), "🔧 <code>%s</code>" % esc(tool_name)]
+    head = "🔔 <b>%s</b> · <code>#%s</code>" % (tg.esc(project), tg.esc(rid[:4]))
+    if session:
+        head += " · сессия <code>%s</code>" % tg.esc(session)
+    rows = [head, "🔧 <code>%s</code>" % tg.esc(tool_name)]
     rows += describe(tool_name, tool_input)
 
     context = payload.get("permission_context")
     reason = context.get("reason") if isinstance(context, dict) else None
     if reason:
-        rows.append("ℹ️ <i>%s</i>" % esc(clip(str(reason), 200)))
+        rows.append("ℹ️ <i>%s</i>" % tg.esc(tg.clip(str(reason), 200)))
     if rule_label:
-        rows.append("♾ «Всегда» добавит правило: <code>%s</code>" % esc(rule_label))
-    rows.append("📁 <i>%s</i>" % esc(clip(cwd, 120)))
-
-    return clip("\n".join(rows), MAX_TEXT)
+        rows.append("♾ «Всегда» добавит правило: <code>%s</code>"
+                    % tg.esc(rule_label))
+    rows.append("📁 <i>%s</i>" % tg.esc(tg.clip(cwd, 120)))
+    return tg.clip("\n".join(rows), tg.CHUNK)
 
 
 # --------------------------------------------------------------------------- #
@@ -244,7 +194,7 @@ def derive_rule(tool_name, tool_input, cwd):
         if tool_name in FILE_TOOLS and cwd:
             return tool_name, os.path.join(cwd, "**")
     except Exception as exc:
-        debug("не удалось вывести правило: %s" % exc)
+        tg.debug("правило не выведено: %s" % exc)
     return None
 
 
@@ -252,7 +202,7 @@ def derive_rule(tool_name, tool_input, cwd):
 # Безопасный список
 # --------------------------------------------------------------------------- #
 
-def safelisted(tool_name, tool_input):
+def safelisted(tool_name, tool_input, path=None):
     """True, если команду можно одобрить сразу, не беспокоя Telegram."""
     try:
         if tool_name not in SHELL_TOOLS:
@@ -261,7 +211,7 @@ def safelisted(tool_name, tool_input):
         if not command or any(ch in command for ch in UNSAFE_CHARS):
             return False
         norm = re.sub(r"\s+", " ", command).lower()
-        path = HERE / "safelist.txt"
+        path = path or (tg.HERE / "safelist.txt")
         if not path.exists():
             return False
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -271,175 +221,8 @@ def safelisted(tool_name, tool_input):
             if norm == pattern or norm.startswith(pattern + " "):
                 return True
     except Exception as exc:
-        debug("безопасный список не прочитан: %s" % exc)
+        tg.debug("безопасный список не прочитан: %s" % exc)
     return False
-
-
-# --------------------------------------------------------------------------- #
-# Флажок («занято») и полочка для чужих нажатий
-# --------------------------------------------------------------------------- #
-
-def prepare_state_dir():
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        now = time.time()
-        for item in STATE_DIR.glob("cb-*.json"):
-            try:
-                if now - item.stat().st_mtime > MAILBOX_TTL:
-                    item.unlink()
-            except OSError:
-                pass
-    except Exception as exc:
-        debug("не удалось подготовить рабочую папку: %s" % exc)
-
-
-def take_lock():
-    try:
-        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        try:
-            os.write(fd, ("%d %f" % (os.getpid(), time.time())).encode("ascii"))
-        finally:
-            os.close(fd)
-        return True
-    except FileExistsError:
-        try:
-            if time.time() - LOCK_PATH.stat().st_mtime > LOCK_STALE:
-                LOCK_PATH.unlink()
-                debug("снял брошенный флажок")
-        except OSError:
-            pass
-        return False
-    except Exception as exc:
-        debug("флажок не взят: %s" % exc)
-        return False
-
-
-def drop_lock():
-    try:
-        LOCK_PATH.unlink()
-    except OSError:
-        pass
-
-
-def read_offset():
-    try:
-        return int(OFFSET_PATH.read_text(encoding="ascii").strip())
-    except Exception:
-        return None
-
-
-def write_offset(value):
-    try:
-        OFFSET_PATH.write_text(str(int(value)), encoding="ascii")
-    except Exception as exc:
-        debug("не удалось сохранить номер письма: %s" % exc)
-
-
-def mailbox_put(rid, press):
-    if not re.match(r"^[0-9a-f]{4,16}$", str(rid or "")):
-        return
-    try:
-        target = STATE_DIR / ("cb-%s.json" % rid)
-        tmp = STATE_DIR / ("cb-%s.%d.tmp" % (rid, os.getpid()))
-        tmp.write_text(json.dumps(press), encoding="utf-8")
-        os.replace(str(tmp), str(target))
-        debug("положил на полочку нажатие для %s" % rid)
-    except Exception as exc:
-        debug("не удалось положить на полочку: %s" % exc)
-
-
-def mailbox_take(rid):
-    target = STATE_DIR / ("cb-%s.json" % rid)
-    try:
-        if not target.exists():
-            return None
-        press = json.loads(target.read_text(encoding="utf-8"))
-        target.unlink()
-        debug("забрал своё нажатие с полочки")
-        return press
-    except Exception as exc:
-        debug("не удалось забрать с полочки: %s" % exc)
-        return None
-
-
-# --------------------------------------------------------------------------- #
-# Ожидание нажатия
-# --------------------------------------------------------------------------- #
-
-def parse_press(callback, chat_id, token):
-    """Разбор нажатия. Возвращает (номер запроса, данные) или (None, None)."""
-    sender = str((callback.get("from") or {}).get("id") or "")
-    if sender != str(chat_id):
-        debug("нажатие от посторонних (%s) — игнорирую" % sender)
-        try:
-            api(token, "answerCallbackQuery",
-                {"callback_query_id": callback.get("id"),
-                 "text": "Нет доступа", "show_alert": True}, timeout=10)
-        except TgFail:
-            pass
-        return None, None
-    action, _, rid = str(callback.get("data") or "").partition(":")
-    if action not in ("a", "d", "r") or not rid:
-        return None, None
-    message = callback.get("message") or {}
-    return rid, {
-        "action": action,
-        "callback_id": callback.get("id"),
-        "message_id": message.get("message_id"),
-        "chat_id": (message.get("chat") or {}).get("id"),
-    }
-
-
-def wait_for_press(token, chat_id, rid, deadline):
-    """Круг «полочка → флажок → вопрос Telegram», пока не истечёт время."""
-    while time.time() < deadline:
-        press = mailbox_take(rid)
-        if press:
-            return press
-
-        if not take_lock():
-            time.sleep(1)
-            continue
-
-        try:
-            left = deadline - time.time()
-            if left <= 0:
-                return None
-            offset = read_offset()
-            if offset is None:
-                # Первый запуск: берём только самое свежее письмо, не всю историю.
-                params = {"offset": -1, "timeout": 0}
-            else:
-                params = {"offset": offset,
-                          "timeout": max(1, min(LONG_POLL, int(left)))}
-            params["allowed_updates"] = ["callback_query"]
-            try:
-                updates = api(token, "getUpdates", params,
-                              timeout=params["timeout"] + 20) or []
-            except TgFail as exc:
-                debug("getUpdates не удался: %s" % exc)
-                time.sleep(2)
-                continue
-
-            mine = None
-            for update in updates:
-                if "update_id" in update:
-                    write_offset(update["update_id"] + 1)
-                callback = update.get("callback_query")
-                if not callback:
-                    continue
-                got, press = parse_press(callback, chat_id, token)
-                if not got:
-                    continue
-                if got == rid:
-                    mine = press
-                else:
-                    mailbox_put(got, press)
-            if mine:
-                return mine
-        finally:
-            drop_lock()
-    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -460,52 +243,61 @@ def emit(behavior, message=None, rule=None):
     sys.stdout.flush()
 
 
-def edit_message(token, chat_id, message_id, text, footer):
-    """Переписывает сообщение с итогом. reply_markup не передаём — кнопки уходят."""
-    if not message_id:
-        return
-    try:
-        api(token, "editMessageText", {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": clip(text + "\n\n" + footer, MAX_TEXT + 200),
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }, timeout=15)
-    except TgFail as exc:
-        debug("не удалось переписать сообщение: %s" % exc)
+def keyboard_for(rid, rule, with_session):
+    rows = [[
+        {"text": "✅ Разрешить", "callback_data": "a:%s" % rid},
+        {"text": "❌ Запретить", "callback_data": "d:%s" % rid},
+    ]]
+    second = []
+    if with_session:
+        second.append({"text": "⏳ До конца сессии", "callback_data": "s:%s" % rid})
+    second.append({"text": "✏️ Запретить с причиной", "callback_data": "x:%s" % rid})
+    rows.append(second)
+    if rule:
+        # Для команд на кнопке видно само правило, для файлов путь слишком
+        # длинный — пишем словами, а полное правило остаётся в тексте.
+        label = ("♾ Всегда: %s" % rule[1] if rule[0] in SHELL_TOOLS
+                 else "♾ Всегда: %s в этой папке" % rule[0])
+        rows.append([{"text": tg.clip(label, 48), "callback_data": "r:%s" % rid}])
+    return rows
+
+
+def confirm_keyboard(rid, rule_label):
+    return [[
+        {"text": tg.clip("♾ Да, навсегда: %s" % rule_label, 48),
+         "callback_data": "R:%s" % rid},
+    ], [
+        {"text": "⬅ Отмена", "callback_data": "c:%s" % rid},
+    ]]
 
 
 # --------------------------------------------------------------------------- #
 
 def main():
-    global DEBUG, WAIT_TIMEOUT
-
     raw = sys.stdin.read()
     if not raw or not raw.strip():
-        debug("пустой вход")
+        tg.debug("пустой вход")
         return
     payload = json.loads(raw)
     if not isinstance(payload, dict):
-        debug("вход не является объектом")
+        tg.debug("вход не является объектом")
         return
 
-    env = read_env()
-    DEBUG = env.get("CC_TG_DEBUG", "0") not in ("0", "", "false", "no")
-    try:
-        WAIT_TIMEOUT = max(5, int(env.get("CC_TG_TIMEOUT") or WAIT_TIMEOUT))
-    except ValueError:
-        pass
-
+    env = tg.read_env()
     token = env.get("TG_TOKEN", "")
     chat_id = env.get("TG_CHAT_ID", "")
     if not token or not chat_id:
-        debug("не заполнены TG_TOKEN или TG_CHAT_ID — выхожу молча")
+        tg.debug("не заполнены TG_TOKEN или TG_CHAT_ID — выхожу молча")
         return
 
-    # Страховочный таймер: что бы ни случилось, скрипт завершится сам.
-    threading.Thread(
-        target=lambda: (time.sleep(WAIT_TIMEOUT + WATCHDOG_EXTRA), os._exit(0)),
+    global _TOKEN, _CHAT, _SMODE, _STICKERS
+    _TOKEN, _CHAT = token, chat_id
+    _STICKERS = tg.load_stickers()
+    _SMODE = tg.sticker_mode(env, _STICKERS)
+
+    wait_timeout = tg.number(env, "CC_TG_TIMEOUT", WAIT_DEFAULT, low=5, high=3000)
+    threading.Thread(                     # страховка: скрипт завершится сам
+        target=lambda: (time.sleep(wait_timeout + WATCHDOG_EXTRA), os._exit(0)),
         daemon=True,
     ).start()
 
@@ -514,103 +306,199 @@ def main():
     if not isinstance(tool_input, dict):
         tool_input = {"value": tool_input}
     cwd = str(payload.get("cwd") or "")
+    session_id = payload.get("session_id")
     base = {
         "tool": tool_name,
         "cwd": cwd,
-        "session": payload.get("session_id"),
+        "session": session_id,
         "tool_use_id": payload.get("tool_use_id"),
     }
+    detail = tg.clip(tool_detail(tool_name, tool_input), 200)
 
+    # Тихие часы: ночью не будим, вопрос уходит в терминал.
+    if tg.quiet_now(env.get("CC_TG_QUIET")):
+        tg.log(dict(base, decision="none", via="quiet_hours", detail=detail))
+        return
+
+    # Безопасный список: решаем на месте, в Telegram ничего не отправляем.
     if safelisted(tool_name, tool_input):
-        log(dict(base, decision="allow", via="safelist",
-                 command=clip(tool_input.get("command", ""), 200)))
+        tg.log(dict(base, decision="allow", via="safelist", detail=detail))
+        # Смысл безопасного списка — не беспокоить, поэтому стикер только
+        # в режиме «all», и всегда без звука.
+        pic("safelist", quiet=True, mode=("all" if _SMODE == "all" else "off"))
+        emit("allow")
+        return
+
+    tg.prepare_state_dir()
+
+    # Уже разрешено до конца этой сессии.
+    key = session_key(tool_name, tool_input)
+    if session_id and tg.session_allowed(session_id, key):
+        tg.log(dict(base, decision="allow", via="session_cache", detail=detail))
         emit("allow")
         return
 
     rid = uuid.uuid4().hex[:8]
     rule = derive_rule(tool_name, tool_input, cwd)
     rule_label = rule[1] if rule else None
+    text = build_text(payload, rid, rule_label)
+    keyboard = keyboard_for(rid, rule, bool(session_id))
 
-    keyboard = [[
-        {"text": "✅ Разрешить", "callback_data": "a:%s" % rid},
-        {"text": "❌ Запретить", "callback_data": "d:%s" % rid},
-    ]]
-    if rule:
-        # Для команд на кнопке видно само правило, для файлов путь слишком
-        # длинный — пишем словами, а полное правило остаётся в тексте.
-        label = ("♾ Всегда: %s" % rule[1] if tool_name in SHELL_TOOLS
-                 else "♾ Всегда: %s в этой папке" % tool_name)
-        keyboard.append([{"text": clip(label, 48), "callback_data": "r:%s" % rid}])
-
-    text = build_text(payload, rule_label)
-    prepare_state_dir()
-
+    pic(sticker_for_request(tool_name, tool_input), quiet=True)
     try:
-        sent = api(token, "sendMessage", {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-            "reply_markup": {"inline_keyboard": keyboard},
-        }, timeout=20)
-    except TgFail as exc:
-        debug("сообщение не отправлено: %s" % exc)
-        log(dict(base, decision="none", via="send_failed", error=str(exc)))
+        sent = tg.send(token, chat_id, text, keyboard=keyboard)
+    except tg.TgFail as exc:
+        tg.debug("сообщение не отправлено: %s" % exc)
+        tg.log(dict(base, decision="none", via="send_failed", error=str(exc)))
         return
 
     message_id = (sent or {}).get("message_id")
     chat_for_edit = ((sent or {}).get("chat") or {}).get("id", chat_id)
-    debug("отправлено сообщение %s, запрос %s" % (message_id, rid))
+    tg.debug("отправлено сообщение %s, запрос %s" % (message_id, rid))
 
-    press = wait_for_press(token, chat_id, rid, time.time() + WAIT_TIMEOUT)
+    deadline = time.time() + wait_timeout
+    decided = handle(token, chat_id, chat_for_edit, message_id, rid, text,
+                     rule, rule_label, session_id, key, deadline, base, detail)
+    if not decided:
+        tg.edit(token, chat_for_edit, message_id,
+                text + "\n\n⏳ Время истекло в %s — вопрос ушёл в терминал"
+                % time.strftime("%H:%M"))
+        pic("timeout")
+        tg.log(dict(base, decision="none", via="timeout", rid=rid, detail=detail))
+
+
+def handle(token, chat_id, chat_for_edit, message_id, rid, text, rule,
+           rule_label, session_id, key, deadline, base, detail):
+    """Ждёт и обрабатывает нажатия, пока не будет окончательного решения.
+
+    Возвращает True, если решение напечатано, и False, если истекло время.
+    «Всегда» требует подтверждения, поэтому цикл: подтвердили — решаем,
+    отменили — возвращаем исходные кнопки и ждём снова.
+    """
+    while time.time() < deadline:
+        kind, data = tg.wait(token, chat_id, deadline, rid=rid)
+        if kind != "press":
+            return False
+
+        action = data.get("action")
+        callback_id = data.get("callback_id")
+        chat = data.get("chat_id") or chat_for_edit
+        msg = data.get("message_id") or message_id
+        stamp = time.strftime("%H:%M")
+
+        if action == "a":
+            tg.answer_press(token, callback_id, "Разрешено")
+            pic("allowed")
+            tg.edit(token, chat, msg, text + "\n\n✅ Разрешено в %s" % stamp)
+            tg.log(dict(base, decision="allow", via="telegram", rid=rid,
+                        detail=detail))
+            emit("allow")
+            return True
+
+        if action == "s":
+            tg.answer_press(token, callback_id, "Разрешено до конца сессии")
+            pic("session_allowed")
+            if session_id:
+                tg.session_allow(session_id, key)
+            tg.edit(token, chat, msg,
+                    text + "\n\n⏳ Разрешено до конца сессии в %s" % stamp)
+            tg.log(dict(base, decision="allow", via="telegram_session", rid=rid,
+                        detail=detail))
+            emit("allow")
+            return True
+
+        if action == "d":
+            tg.answer_press(token, callback_id, "Запрещено")
+            pic("denied")
+            tg.edit(token, chat, msg, text + "\n\n❌ Запрещено в %s" % stamp)
+            tg.log(dict(base, decision="deny", via="telegram", rid=rid,
+                        detail=detail))
+            emit("deny", message="Запрещено из Telegram")
+            return True
+
+        if action == "x":
+            tg.answer_press(token, callback_id, "Жду причину")
+            pic("waiting_reply", quiet=True)
+            return deny_with_reason(token, chat_id, chat, msg, rid, text,
+                                   deadline, base, detail)
+
+        if action == "r" and rule:
+            # Второй шаг: правило действует постоянно, спрашиваем ещё раз.
+            tg.answer_press(token, callback_id, "Подтвердите правило")
+            tg.edit(token, chat, msg,
+                    text + "\n\n♾ <b>Подтвердите:</b> правило <code>%s</code> "
+                           "останется навсегда" % tg.esc(rule_label))
+            try:
+                tg.edit_keyboard(token, chat, msg, confirm_keyboard(rid, rule_label))
+            except tg.TgFail as exc:
+                tg.debug("кнопки подтверждения не поставлены: %s" % exc)
+            continue
+
+        if action == "R" and rule:
+            tg.answer_press(token, callback_id, "Разрешено навсегда")
+            pic("always_allowed")
+            tg.edit(token, chat, msg,
+                    text + "\n\n♾ Разрешено навсегда в %s · правило <code>%s</code>"
+                    % (stamp, tg.esc(rule_label)))
+            tg.log(dict(base, decision="allow", via="telegram_always", rid=rid,
+                        rule=rule_label, detail=detail))
+            emit("allow", rule=rule)
+            return True
+
+        if action == "c":
+            tg.answer_press(token, callback_id, "Отменено")
+            tg.edit(token, chat, msg, text)
+            try:
+                tg.edit_keyboard(token, chat, msg,
+                                 keyboard_for(rid, rule, bool(session_id)))
+            except tg.TgFail as exc:
+                tg.debug("кнопки не возвращены: %s" % exc)
+            continue
+
+        tg.debug("неизвестное действие %r" % action)
+    return False
+
+
+def deny_with_reason(token, chat_id, chat, msg, rid, text, deadline, base, detail):
+    """Просит написать причину отказа; её текст уходит обратно в Claude."""
+    ask = text + ("\n\n✏️ <b>Напишите причину отказа</b> ответом на это сообщение."
+                  "\nБез ответа запрет уйдёт без пояснения.")
+    tg.edit(token, chat, msg, ask)
+    limit = min(deadline, time.time() + REASON_WAIT)
+    kind, data = tg.wait(token, chat_id, limit, rid=rid, want_text=True,
+                         reply_to=msg)
     stamp = time.strftime("%H:%M")
 
-    if not press:
-        edit_message(token, chat_for_edit, message_id, text,
-                     "⏳ Время истекло в %s — вопрос ушёл в терминал" % stamp)
-        log(dict(base, decision="none", via="timeout", rid=rid))
-        return
-
-    action = press.get("action")
-    if action == "a":
-        footer, toast = "✅ Разрешено в %s" % stamp, "Разрешено"
-    elif action == "r":
-        footer = "♾ Разрешено навсегда в %s · правило %s" % (stamp, rule_label)
-        toast = "Разрешено навсегда"
-    else:
-        footer, toast = "❌ Запрещено в %s" % stamp, "Запрещено"
-
-    try:
-        api(token, "answerCallbackQuery",
-            {"callback_query_id": press.get("callback_id"), "text": toast}, timeout=10)
-    except TgFail as exc:
-        debug("не удалось подтвердить нажатие: %s" % exc)
-
-    edit_message(token, press.get("chat_id") or chat_for_edit,
-                 press.get("message_id") or message_id, text, footer)
-
-    if action == "a":
-        log(dict(base, decision="allow", via="telegram", rid=rid))
+    reason = ""
+    if kind == "text":
+        reason = tg.clip(data.get("text", "").strip(), 400)
+    elif kind == "press" and data.get("action") == "a":
+        # Передумали и нажали «Разрешить» — уважаем последнее действие.
+        tg.answer_press(token, data.get("callback_id"), "Разрешено")
+        pic("allowed")
+        tg.edit(token, chat, msg, text + "\n\n✅ Разрешено в %s" % stamp)
+        tg.log(dict(base, decision="allow", via="telegram", rid=rid, detail=detail))
         emit("allow")
-    elif action == "r":
-        log(dict(base, decision="allow", via="telegram_always",
-                 rid=rid, rule=rule_label))
-        emit("allow", rule=rule)
-    else:
-        log(dict(base, decision="deny", via="telegram", rid=rid))
-        emit("deny", message="Запрещено из Telegram")
+        return True
+
+    footer = "❌ Запрещено в %s" % stamp
+    if reason:
+        footer += "\n💬 <i>%s</i>" % tg.esc(reason)
+    tg.edit(token, chat, msg, text + "\n\n" + footer)
+    pic("denied_reason" if reason else "denied")
+    tg.log(dict(base, decision="deny", via="telegram_reason", rid=rid,
+                reason=reason, detail=detail))
+    emit("deny", message=reason or "Запрещено из Telegram")
+    return True
 
 
 if __name__ == "__main__":
     try:
         main()
     except BaseException as exc:          # молчать обязаны при любой ошибке
-        debug("ошибка: %r" % exc)
-        if DEBUG:
-            import traceback
-            traceback.print_exc()
+        tg.debug("ошибка: %r" % exc)
         try:
-            log({"decision": "none", "via": "error", "error": repr(exc)})
+            tg.log({"decision": "none", "via": "error", "error": repr(exc)})
         except Exception:
             pass
     sys.exit(0)
