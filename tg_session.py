@@ -74,12 +74,16 @@ def main():
     ).start()
 
     env = tg.read_env()
+    if not tg.flag(env, 'CC_TG_ENABLED', True):
+        return                       # выключено — молчим совсем
     notes = problems(env, payload)
     token = env.get("TG_TOKEN", "")
     chat_id = env.get("TG_CHAT_ID", "")
 
     # Стикер режима: сразу видно, будут ли вообще приходить вопросы.
     if token and chat_id:
+        tg.prepare_state_dir()
+        tg.sweep_pending(token)      # хвосты от прошлой сессии
         stickers = tg.load_stickers()
         smode = tg.sticker_mode(env, stickers)
         mode = str(payload.get("permission_mode") or "").strip().lower()

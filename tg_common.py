@@ -40,7 +40,7 @@ STICKERS_PATH = HERE / "stickers.json"
 ENV_KEYS = (
     "TG_TOKEN", "TG_CHAT_ID", "CC_TG_TIMEOUT", "CC_TG_DEBUG", "CC_TG_QUIET",
     "CC_TG_FOLLOWUP", "CC_TG_FOLLOWUP_WAIT", "CC_TG_FOLLOWUP_MAX",
-    "CC_TG_ANSWER_LIMIT", "CC_TG_STICKERS",
+    "CC_TG_ANSWER_LIMIT", "CC_TG_STICKERS", "CC_TG_ENABLED",
 )
 
 # Все события, под которые можно нарисовать стикер. Порядок важен:
@@ -157,6 +157,18 @@ def hook_timeout(event, path=None):
     except Exception as exc:
         debug("лимит хука %s не прочитан: %s" % (event, exc))
         return None
+
+
+def enabled(env):
+    """Включён ли бот вообще.
+
+    Выключатель на один рубильник: CC_TG_ENABLED=0 в .env — и все три хука
+    молча ничего не делают, вопросы идут обычным путём в терминал.
+    """
+    if not flag(env, "CC_TG_ENABLED", True):
+        debug("выключено через CC_TG_ENABLED")
+        return False
+    return bool(env.get("TG_TOKEN")) and bool(env.get("TG_CHAT_ID"))
 
 
 def quiet_now(spec, now=None):
@@ -661,6 +673,57 @@ def inbox_take(since, reply_to=None):
     except Exception as exc:
         debug("из входящих не забрал: %s" % exc)
         return None
+
+
+def pending_put(rid, chat_id, message_id, text):
+    """Запоминает отправленный вопрос, чтобы потом убрать у него кнопки.
+
+    Если ответить в терминале, Claude Code убивает процесс хука и переписать
+    сообщение тот уже не успевает. Запись остаётся — её подберёт следующий
+    запуск и уберёт кнопки у вопроса, который давно решён.
+    """
+    try:
+        _write_json(STATE_DIR / ("pending-%s.json" % rid),
+                    {"pid": os.getpid(), "chat_id": chat_id,
+                     "message_id": message_id, "text": text, "ts": time.time()})
+    except Exception as exc:
+        debug("вопрос не записан: %s" % exc)
+
+
+def pending_drop(rid):
+    try:
+        (STATE_DIR / ("pending-%s.json" % rid)).unlink()
+    except OSError:
+        pass
+
+
+def sweep_pending(token, note="⌨️ Решено в терминале", max_age=900):
+    """Убирает кнопки у вопросов, чьи процессы уже не живы."""
+    try:
+        mine = os.getpid()
+        for item in list(STATE_DIR.glob("pending-*.json")):
+            try:
+                data = json.loads(item.read_text(encoding="utf-8"))
+            except Exception:
+                item.unlink()
+                continue
+            pid = data.get("pid")
+            age = time.time() - float(data.get("ts") or 0)
+            if pid == mine:
+                continue
+            # Номер процесса система может выдать заново, поэтому старые
+            # записи подчищаем в любом случае.
+            if pid and pid_alive(pid) and age < max_age:
+                continue
+            try:
+                edit(token, data.get("chat_id"), data.get("message_id"),
+                     (data.get("text") or "") + "\n\n" + note)
+                debug("убрал кнопки у брошенного вопроса %s" % item.stem)
+            except TgFail as exc:
+                debug("не удалось убрать кнопки: %s" % exc)
+            item.unlink()
+    except Exception as exc:
+        debug("уборка брошенных вопросов не удалась: %s" % exc)
 
 
 def session_path(session_id):

@@ -125,8 +125,13 @@ def main():
     env = tg.read_env()
     token = env.get("TG_TOKEN", "")
     chat_id = env.get("TG_CHAT_ID", "")
-    if not token or not chat_id:
+    if not tg.enabled(env):
         return
+
+    tg.prepare_state_dir()
+    # Хук Stop срабатывает сразу после ответа в терминале — удобный момент,
+    # чтобы убрать кнопки у вопросов, на которые ответили мимо Telegram.
+    tg.sweep_pending(token)
 
     quiet = tg.quiet_now(env.get("CC_TG_QUIET"))
     followup_on = tg.flag(env, "CC_TG_FOLLOWUP", False) and not quiet

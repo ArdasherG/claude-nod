@@ -286,8 +286,7 @@ def main():
     env = tg.read_env()
     token = env.get("TG_TOKEN", "")
     chat_id = env.get("TG_CHAT_ID", "")
-    if not token or not chat_id:
-        tg.debug("не заполнены TG_TOKEN или TG_CHAT_ID — выхожу молча")
+    if not tg.enabled(env):
         return
 
     global _TOKEN, _CHAT, _SMODE, _STICKERS
@@ -336,6 +335,7 @@ def main():
         return
 
     tg.prepare_state_dir()
+    tg.sweep_pending(token)          # убрать кнопки у брошенных вопросов
 
     # Уже разрешено до конца этой сессии.
     key = session_key(tool_name, tool_input)
@@ -361,10 +361,14 @@ def main():
     message_id = (sent or {}).get("message_id")
     chat_for_edit = ((sent or {}).get("chat") or {}).get("id", chat_id)
     tg.debug("отправлено сообщение %s, запрос %s" % (message_id, rid))
+    # Если ответят в терминале, нас убьют и кнопки останутся висеть —
+    # запись позволит следующему запуску их убрать.
+    tg.pending_put(rid, chat_for_edit, message_id, text)
 
     deadline = time.time() + wait_timeout
     decided = handle(token, chat_id, chat_for_edit, message_id, rid, text,
                      rule, rule_label, session_id, key, deadline, base, detail)
+    tg.pending_drop(rid)
     if not decided:
         tg.edit(token, chat_for_edit, message_id,
                 text + "\n\n⏳ Время истекло в %s — вопрос ушёл в терминал"

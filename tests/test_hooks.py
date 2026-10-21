@@ -265,6 +265,15 @@ class EnvTest(unittest.TestCase):
     def test_hook_timeout_survives_broken_settings(self):
         self.assertIsNone(tg.hook_timeout("Stop", "нет-такого-файла.json"))
 
+    def test_master_switch(self):
+        full = {"TG_TOKEN": "t", "TG_CHAT_ID": "1"}
+        self.assertTrue(tg.enabled(full))
+        self.assertTrue(tg.enabled(dict(full, CC_TG_ENABLED="1")))
+        for off in ("0", "off", "no", "false"):
+            self.assertFalse(tg.enabled(dict(full, CC_TG_ENABLED=off)), off)
+        self.assertFalse(tg.enabled({"TG_TOKEN": "t"}), "без chat_id — выключено")
+        self.assertFalse(tg.enabled({}), "без настроек — выключено")
+
     def test_quiet_hours(self):
         mk = lambda h, m=0: time.struct_time((2026, 10, 21, h, m, 0, 2, 294, 0))
         self.assertTrue(tg.quiet_now("23:00-08:00", mk(23, 30)))
@@ -387,6 +396,52 @@ class StateTest(StateCase):
         tg.inbox_put({"ts": now, "text": "общее", "reply_to": None})
         tg.inbox_put({"ts": now, "text": "адресное", "reply_to": 7})
         self.assertEqual(tg.inbox_take(now - 1, reply_to=7)["text"], "адресное")
+
+    def test_pending_roundtrip(self):
+        tg.pending_put("abcd1234", 111, 7, "текст вопроса")
+        path = tg.STATE_DIR / "pending-abcd1234.json"
+        self.assertTrue(path.exists())
+        tg.pending_drop("abcd1234")
+        self.assertFalse(path.exists())
+
+    def test_sweep_clears_abandoned_question(self):
+        """Ответили в терминале, процесс убит — кнопки должны исчезнуть."""
+        tg.pending_put("dead0001", 111, 7, "вопрос")
+        data = json.loads((tg.STATE_DIR / "pending-dead0001.json").read_text("utf-8"))
+        data["pid"] = 999999999                 # такого процесса нет
+        (tg.STATE_DIR / "pending-dead0001.json").write_text(
+            json.dumps(data), encoding="utf-8")
+
+        edits = []
+        saved = tg.api
+        tg.api = lambda token, method, payload, timeout=30: edits.append(
+            (method, payload.get("message_id"), payload.get("text")))
+        try:
+            tg.sweep_pending("tok")
+        finally:
+            tg.api = saved
+        self.assertEqual(len(edits), 1, "сообщение должны переписать один раз")
+        self.assertEqual(edits[0][0], "editMessageText")
+        self.assertIn("терминале", edits[0][2])
+        self.assertFalse((tg.STATE_DIR / "pending-dead0001.json").exists())
+
+    def test_sweep_spares_live_question(self):
+        """Пока процесс жив и ждёт, трогать его сообщение нельзя."""
+        tg.pending_put("alive001", 111, 7, "вопрос")     # pid текущий
+        edits = []
+        saved = tg.api
+        tg.api = lambda *a, **k: edits.append(a)
+        try:
+            tg.sweep_pending("tok")
+        finally:
+            tg.api = saved
+        self.assertEqual(edits, [])
+        self.assertTrue((tg.STATE_DIR / "pending-alive001.json").exists())
+
+    def test_sweep_survives_broken_file(self):
+        (tg.STATE_DIR / "pending-broken.json").write_text("{не json", encoding="utf-8")
+        tg.sweep_pending("tok")
+        self.assertFalse((tg.STATE_DIR / "pending-broken.json").exists())
 
     def test_session_cache(self):
         key = ap.session_key("Bash", {"command": "git push origin main"})
