@@ -132,6 +132,71 @@ def spans(flags, gap):
     return out
 
 
+def dekey(width, height, rows, light=225, grey=26):
+    """Убирает светлый фон заливкой от краёв картинки.
+
+    Нужно, когда «прозрачность» нарисована как настоящая шахматка: заливаем
+    только то, что связано с краем, поэтому белое внутри персонажа остаётся.
+    Заодно съедается белая обводка стикера — её потом рисуем заново.
+    """
+    from collections import deque
+
+    def is_light(x, y):
+        i = x * 4
+        r, g, b = rows[y][i], rows[y][i + 1], rows[y][i + 2]
+        return min(r, g, b) >= light and max(r, g, b) - min(r, g, b) <= grey
+
+    seen = bytearray(width * height)
+    queue = deque()
+    for x in range(width):
+        for y in (0, height - 1):
+            if is_light(x, y) and not seen[y * width + x]:
+                seen[y * width + x] = 1
+                queue.append((x, y))
+    for y in range(height):
+        for x in (0, width - 1):
+            if is_light(x, y) and not seen[y * width + x]:
+                seen[y * width + x] = 1
+                queue.append((x, y))
+
+    while queue:
+        x, y = queue.popleft()
+        rows[y][x * 4 + 3] = 0
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if 0 <= nx < width and 0 <= ny < height and not seen[ny * width + nx]:
+                if is_light(nx, ny):
+                    seen[ny * width + nx] = 1
+                    queue.append((nx, ny))
+    return rows
+
+
+def add_outline(width, height, rows, radius=9):
+    """Обводит непрозрачные области белым кантом заданной толщины."""
+    from collections import deque
+
+    distance = bytearray(width * height)        # 0 — ещё не размечено
+    queue = deque()
+    for y in range(height):
+        row = rows[y]
+        base = y * width
+        for x in range(width):
+            if row[x * 4 + 3] > ALPHA_FLOOR:
+                distance[base + x] = 1
+                queue.append((x, y, 1))
+
+    while queue:
+        x, y, step = queue.popleft()
+        if step > radius:
+            continue
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if 0 <= nx < width and 0 <= ny < height and not distance[ny * width + nx]:
+                distance[ny * width + nx] = step + 1
+                i = nx * 4
+                rows[ny][i:i + 4] = bytes((255, 255, 255, 255))
+                queue.append((nx, ny, step + 1))
+    return rows
+
+
 def components(width, height, rows, step=2):
     """Связные области непрозрачных пикселей: (площадь, left, top, right, bottom).
 
@@ -176,6 +241,75 @@ def components(width, height, rows, step=2):
     return found
 
 
+def isolate(rows, box, reach=26, step=2):
+    """Вырезает прямоугольник и стирает в нём чужие кусочки.
+
+    В рамку соседа нередко попадает край другого стикера: брызги, уголок
+    обводки. Оставляем самую большую область и то, что к ней примыкает,
+    остальное делаем прозрачным.
+    """
+    from collections import deque
+
+    left, top, right, bottom = box
+    sub = [bytearray(rows[y][left * 4:right * 4]) for y in range(top, bottom)]
+    width, height = right - left, bottom - top
+
+    cols = (width + step - 1) // step
+    lines = (height + step - 1) // step
+    mask = bytearray(cols * lines)
+    for y in range(lines):
+        row = sub[min(y * step, height - 1)]
+        for x in range(cols):
+            if row[min(x * step, width - 1) * 4 + 3] > ALPHA_FLOOR:
+                mask[y * cols + x] = 1
+
+    groups = []
+    for start in range(cols * lines):
+        if not mask[start]:
+            continue
+        queue, cells = deque([start]), []
+        mask[start] = 0
+        while queue:
+            node = queue.popleft()
+            cells.append(node)
+            cx, cy = node % cols, node // cols
+            for nx, ny in ((cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)):
+                if 0 <= nx < cols and 0 <= ny < lines:
+                    other = ny * cols + nx
+                    if mask[other]:
+                        mask[other] = 0
+                        queue.append(other)
+        groups.append(cells)
+
+    if len(groups) <= 1:
+        return sub, width, height
+
+    groups.sort(key=len, reverse=True)
+    main = groups[0]
+    main_box = cells_box(main, cols)
+    for cells in groups[1:]:
+        if near(cells_box(cells, cols), main_box) <= reach / step:
+            continue
+        for node in cells:                       # чужое — стираем
+            cx, cy = (node % cols) * step, (node // cols) * step
+            for y in range(cy, min(cy + step, height)):
+                for x in range(cx, min(cx + step, width)):
+                    sub[y][x * 4 + 3] = 0
+    return sub, width, height
+
+
+def cells_box(cells, cols):
+    xs = [c % cols for c in cells]
+    ys = [c // cols for c in cells]
+    return min(xs), min(ys), max(xs) + 1, max(ys) + 1
+
+
+def near(a, b):
+    dx = max(b[0] - a[2], a[0] - b[2], 0)
+    dy = max(b[1] - a[3], a[1] - b[3], 0)
+    return (dx * dx + dy * dy) ** 0.5
+
+
 def attach_small(big, small, reach=50):
     """Прилепляет мелочь (блёстки, значки) к ближайшему стикеру."""
     boxes = [list(b) for b in big]
@@ -205,7 +339,7 @@ def dense(counts, extent, ratio):
     return [count > floor for count in counts]
 
 
-def find_boxes(width, height, rows):
+def find_boxes(width, height, rows, reach=50):
     """Прямоугольники стикеров в порядке чтения: сверху вниз, слева направо."""
     found = components(width, height, rows)
     if not found:
@@ -214,16 +348,41 @@ def find_boxes(width, height, rows):
     big = [(left, top, right, bottom)
            for area, left, top, right, bottom in found if area > largest * 0.15]
     small = [b for b in found if b[0] <= largest * 0.15]
-    boxes = attach_small(big, small)
+    boxes = attach_small(big, small, reach)
 
     # Порядок чтения: сначала по рядам, внутри ряда слева направо. Ряд
     # определяем по середине стикера, округлённой до типичной высоты.
     heights = sorted(bottom - top for _left, top, _right, bottom in boxes)
     line_height = max(1, heights[len(heights) // 2])
     boxes.sort(key=lambda b: (int((b[1] + b[3]) / 2 / line_height), b[0]))
-    boxes = split_wide(rows, boxes)
+    boxes = declash(split_wide(rows, boxes))
     boxes.sort(key=lambda b: (int((b[1] + b[3]) / 2 / line_height), b[0]))
     return [tighten(rows, *b) for b in boxes]
+
+
+def declash(boxes):
+    """Разводит пересекающиеся рамки, деля общую полосу пополам.
+
+    Иначе в рамку попадает край соседа: на плотном листе прямоугольники
+    соседних стикеров заходят друг на друга.
+    """
+    out = [list(b) for b in boxes]
+    for i in range(len(out)):
+        for j in range(i + 1, len(out)):
+            a, b = out[i], out[j]
+            over_x = min(a[2], b[2]) - max(a[0], b[0])
+            over_y = min(a[3], b[3]) - max(a[1], b[1])
+            if over_x <= 0 or over_y <= 0:
+                continue
+            if over_x <= over_y:                      # режем по вертикали
+                first, second = (a, b) if a[0] + a[2] < b[0] + b[2] else (b, a)
+                middle = (max(a[0], b[0]) + min(a[2], b[2])) // 2
+                first[2], second[0] = middle, middle
+            else:                                     # режем по горизонтали
+                first, second = (a, b) if a[1] + a[3] < b[1] + b[3] else (b, a)
+                middle = (max(a[1], b[1]) + min(a[3], b[3])) // 2
+                first[3], second[1] = middle, middle
+    return [tuple(b) for b in out]
 
 
 def split_wide(rows, boxes, factor=1.4):
@@ -388,7 +547,22 @@ def main():
     width, height, rows = read_png(source)
     print("  %dx%d" % (width, height))
 
-    boxes = find_boxes(width, height, rows)
+    opaque_everywhere = all(line[x * 4 + 3] > ALPHA_FLOOR
+                            for line in rows[::16] for x in range(0, width, 16))
+    if opaque_everywhere or "--dekey" in sys.argv:
+        print("  прозрачности нет — убираю светлый фон заливкой от краёв")
+        dekey(width, height, rows)
+        radius = 9
+        if "--outline" in sys.argv:
+            radius = int(sys.argv[sys.argv.index("--outline") + 1])
+        if radius:
+            print("  рисую белую обводку в %d пикселей" % radius)
+            add_outline(width, height, rows, radius)
+
+    reach = 50
+    if "--reach" in sys.argv:
+        reach = int(sys.argv[sys.argv.index("--reach") + 1])
+    boxes = find_boxes(width, height, rows, reach)
     print("найдено стикеров: %d" % len(boxes))
     if not boxes:
         print("Ничего не нашёл. Фон должен быть прозрачным, а стикеры — "
@@ -397,7 +571,8 @@ def main():
 
     for index, box in enumerate(boxes, 1):
         left, top, right, bottom = box
-        canvas = to_canvas(rows, box)
+        sub, sub_w, sub_h = isolate(rows, box)
+        canvas = to_canvas(sub, (0, 0, sub_w, sub_h))
         path = os.path.join(out_dir, "%02d.png" % index)
         write_png(path, CANVAS, CANVAS, canvas)
         print("  %02d  %4dx%-4d -> %s  %d КБ"
