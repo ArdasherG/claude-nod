@@ -1,0 +1,5 @@
+.env
+decisions.jsonl
+*.log
+__pycache__/
+*.pyc
