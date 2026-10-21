@@ -296,6 +296,12 @@ def main():
     _SMODE = tg.sticker_mode(env, _STICKERS)
 
     wait_timeout = tg.number(env, "CC_TG_TIMEOUT", WAIT_DEFAULT, low=5, high=3000)
+    # Не ждём дольше, чем Claude Code готов терпеть хук: иначе нас оборвут,
+    # и нажатие, сделанное в последний момент, пропадёт.
+    limit = tg.hook_timeout(HOOK_EVENT)
+    if limit and wait_timeout > limit - WATCHDOG_EXTRA - 5:
+        wait_timeout = max(5, int(limit - WATCHDOG_EXTRA - 5))
+        tg.debug("ожидание ужато до %d с под лимит хука %d с" % (wait_timeout, limit))
     threading.Thread(                     # страховка: скрипт завершится сам
         target=lambda: (time.sleep(wait_timeout + WATCHDOG_EXTRA), os._exit(0)),
         daemon=True,

@@ -131,6 +131,13 @@ def main():
     quiet = tg.quiet_now(env.get("CC_TG_QUIET"))
     followup_on = tg.flag(env, "CC_TG_FOLLOWUP", False) and not quiet
     wait_for = tg.number(env, "CC_TG_FOLLOWUP_WAIT", FOLLOWUP_WAIT, low=10, high=600)
+    # Не ждём дольше, чем Claude Code готов терпеть хук: иначе он оборвёт нас
+    # на полуслове и ваш ответ пропадёт. Лимит берём из его же настроек.
+    limit = tg.hook_timeout(HOOK_EVENT)
+    if limit and wait_for > limit - WATCHDOG_EXTRA - 5:
+        wait_for = max(10, int(limit - WATCHDOG_EXTRA - 5))
+        tg.debug("окно ожидания ужато до %d с под лимит хука %d с"
+                 % (wait_for, limit))
     max_followups = tg.number(env, "CC_TG_FOLLOWUP_MAX", FOLLOWUP_MAX, low=0, high=20)
     limit = tg.number(env, "CC_TG_ANSWER_LIMIT", ANSWER_LIMIT, low=0, high=40000)
 

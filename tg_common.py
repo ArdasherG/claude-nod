@@ -137,6 +137,28 @@ def number(env, key, default, low=None, high=None):
     return value
 
 
+def hook_timeout(event, path=None):
+    """Сколько секунд Claude Code готов ждать этот хук, по его settings.json.
+
+    Нужно, чтобы ожидание ответа не оказалось длиннее лимита: иначе хук
+    обрывают на полуслове и ответ пропадает. Вернёт None, если лимит не задан
+    или файл не прочитался — тогда ограничивать нечем.
+    """
+    try:
+        path = path or (Path.home() / ".claude" / "settings.json")
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        limits = []
+        for entry in (data.get("hooks") or {}).get(event) or []:
+            for item in entry.get("hooks") or []:
+                value = item.get("timeout")
+                if isinstance(value, (int, float)) and value > 0:
+                    limits.append(float(value))
+        return min(limits) if limits else None
+    except Exception as exc:
+        debug("лимит хука %s не прочитан: %s" % (event, exc))
+        return None
+
+
 def quiet_now(spec, now=None):
     """True, если текущее время попадает в тихие часы вида "23:00-08:00"."""
     spec = (spec or "").strip()

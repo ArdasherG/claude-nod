@@ -242,6 +242,29 @@ class EnvTest(unittest.TestCase):
             else:
                 os.environ["TG_TOKEN"] = saved
 
+    def test_hook_timeout_read_from_settings(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as fh:
+            json.dump({"hooks": {
+                "Stop": [{"hooks": [{"type": "command", "timeout": 240}]}],
+                "PermissionRequest": [{"matcher": ".*", "hooks": [
+                    {"type": "command", "timeout": 360},
+                    {"type": "command", "timeout": 90}]}],
+                "SessionStart": [{"hooks": [{"type": "command"}]}],
+            }}, fh)
+            path = fh.name
+        try:
+            self.assertEqual(tg.hook_timeout("Stop", path), 240)
+            # из нескольких хуков на событии важен самый строгий лимит
+            self.assertEqual(tg.hook_timeout("PermissionRequest", path), 90)
+            self.assertIsNone(tg.hook_timeout("SessionStart", path))
+            self.assertIsNone(tg.hook_timeout("НетТакого", path))
+        finally:
+            os.unlink(path)
+
+    def test_hook_timeout_survives_broken_settings(self):
+        self.assertIsNone(tg.hook_timeout("Stop", "нет-такого-файла.json"))
+
     def test_quiet_hours(self):
         mk = lambda h, m=0: time.struct_time((2026, 10, 21, h, m, 0, 2, 294, 0))
         self.assertTrue(tg.quiet_now("23:00-08:00", mk(23, 30)))
