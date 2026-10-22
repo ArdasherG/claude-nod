@@ -125,12 +125,12 @@ def main():
     env = tg.read_env()
     token = env.get("TG_TOKEN", "")
     chat_id = env.get("TG_CHAT_ID", "")
+    # Команды слушаем в конце каждого хода, в любом состоянии: иначе /off
+    # прочитать некому, пока никто не ждёт ответа, а /on — пока бот выключен.
+    tg.prepare_state_dir()
+    tg.poll_commands(token, chat_id)
+    env = tg.read_env()                    # команда могла только что всё изменить
     if not tg.enabled(env):
-        # Выключенный бот обязан слышать /on, иначе включить его с телефона
-        # будет нечем. Один быстрый запрос в конце хода.
-        if token and chat_id:
-            tg.prepare_state_dir()
-            tg.poll_commands(token, chat_id)
         return
 
     tg.prepare_state_dir()

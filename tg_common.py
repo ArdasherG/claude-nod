@@ -954,6 +954,8 @@ def handle_command(text, token, chat_id):
             env.get("CC_TG_QUIET") or "не заданы")
     else:
         answer = "Команды: /on — включить, /off — выключить, /status — состояние"
+    log({"tool": "command", "via": "command", "command": word,
+         "enabled_before": now, "enabled_after": enabled(read_env())})
     try:
         send(token, chat_id, answer, quiet=True)
     except TgFail as exc:
@@ -977,7 +979,9 @@ def poll_commands(token, chat_id, timeout=5):
         return False
     try:
         offset = read_offset()
-        params = {"timeout": 0, "allowed_updates": ["message"],
+        # Просить только сообщения нельзя: подтверждение номера стирает из
+        # очереди и нажатия кнопок, которых мы бы не увидели.
+        params = {"timeout": 0, "allowed_updates": ["callback_query", "message"],
                   "offset": offset if offset is not None else -1}
         try:
             updates = api(token, "getUpdates", params, timeout=timeout) or []
@@ -996,9 +1000,21 @@ def poll_commands(token, chat_id, timeout=5):
         for update in updates:
             if "update_id" in update:
                 write_offset(update["update_id"] + 1)
+            callback = update.get("callback_query")
+            if callback:
+                got, press = parse_press(callback, chat_id, token)
+                if got and is_pending(got):
+                    mailbox_put(got, press)      # ждёт живой процесс
+                elif got:
+                    close_orphan_press(token, press)
+                continue
             parsed = parse_text(update.get("message") or {}, chat_id)
-            if parsed and handle_command(parsed["text"], token, chat_id):
+            if not parsed:
+                continue
+            if handle_command(parsed["text"], token, chat_id):
                 acted = True
+            else:
+                inbox_put(parsed)                # вдруг это ответ, пусть полежит
         return acted
     finally:
         drop_lock()
