@@ -940,6 +940,10 @@ def handle_command(text, token, chat_id):
     env = read_env()
     now = enabled(env)
 
+    word = {"/вкл": "/on", "/включить": "/on", "/выкл": "/off",
+            "/выключить": "/off", "/статус": "/status",
+            "/состояние": "/status"}.get(word, word)
+
     if word in ("/on", "/start"):
         set_enabled(True)
         answer = ("✅ Включён — вопросы снова приходят сюда."
@@ -953,7 +957,11 @@ def handle_command(text, token, chat_id):
             "✅ Включён" if now else "🔕 Выключен",
             env.get("CC_TG_QUIET") or "не заданы")
     else:
-        answer = "Команды: /on — включить, /off — выключить, /status — состояние"
+        answer = ("Команды:\n"
+                  "/on или /вкл — включить\n"
+                  "/off или /выкл — выключить\n"
+                  "/status или /статус — состояние\n\n"
+                  "Косая черта обязательна: без неё это обычный текст.")
     log({"tool": "command", "via": "command", "command": word,
          "enabled_before": now, "enabled_after": enabled(read_env())})
     try:

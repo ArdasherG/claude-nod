@@ -314,6 +314,9 @@ class EnvTest(unittest.TestCase):
 
     def test_commands_recognised(self):
         sent, saved_send, saved_env = [], tg.send, tg.ENV_PATH
+        # Журнал уводим во временный файл: тесты не должны писать в настоящий.
+        saved_log = tg.LOG_PATH
+        tg.LOG_PATH = Path(tempfile.gettempdir()) / "cc-tg-test-log.jsonl"
         import tempfile as tf
         with tf.NamedTemporaryFile("w", suffix=".env", delete=False,
                                    encoding="utf-8") as fh:
@@ -334,7 +337,7 @@ class EnvTest(unittest.TestCase):
                              "обычный текст командой не считается")
             self.assertEqual(len(sent), 4, "на каждую команду — один ответ")
         finally:
-            tg.send, tg.ENV_PATH = saved_send, saved_env
+            tg.send, tg.ENV_PATH, tg.LOG_PATH = saved_send, saved_env, saved_log
             os.unlink(path)
 
     def test_quiet_hours(self):
