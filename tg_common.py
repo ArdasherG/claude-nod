@@ -798,6 +798,28 @@ def parse_text(message, chat_id):
             "message_id": message.get("message_id"), "reply_to": reply}
 
 
+def close_orphan_press(token, press, note="⌨️ Этот вопрос уже закрыт"):
+    """Отвечает на нажатие, которого никто не ждёт, и убирает кнопки.
+
+    Так бывает, когда на вопрос ответили в терминале или хук уже завершился:
+    процесса нет, отвечать некому, и Telegram бесконечно крутит спиннер.
+    """
+    answer_press(token, press.get("callback_id"), "Вопрос уже закрыт")
+    try:
+        edit_keyboard(token, press.get("chat_id"), press.get("message_id"), [])
+        debug("закрыл осиротевшее нажатие")
+    except TgFail as exc:
+        debug("осиротевшее нажатие не закрыть: %s" % exc)
+
+
+def is_pending(rid):
+    """Ждёт ли кто-то ответа по этому запросу."""
+    try:
+        return (STATE_DIR / ("pending-%s.json" % rid)).exists()
+    except Exception:
+        return False
+
+
 def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
          since=None):
     """Ждёт нажатие кнопки с номером `rid` и/или текстовый ответ.
@@ -852,8 +874,10 @@ def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
                         continue
                     if rid and got == rid:
                         mine = press
+                    elif is_pending(got):
+                        mailbox_put(got, press)      # ждёт другой процесс
                     else:
-                        mailbox_put(got, press)
+                        close_orphan_press(token, press)
                     continue
                 message = update.get("message")
                 if message:

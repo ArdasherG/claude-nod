@@ -506,6 +506,49 @@ class StateTest(StateCase):
         tg.sweep_pending("tok")
         self.assertFalse((tg.STATE_DIR / "pending-broken.json").exists())
 
+    def press_update(self, rid):
+        return {"update_id": 5, "callback_query": {
+            "id": "cb", "from": {"id": "111"}, "data": "a:" + rid,
+            "message": {"message_id": 7, "chat": {"id": 111}}}}
+
+    def run_wait(self, updates, rid):
+        """Один проход опроса с подставным Telegram."""
+        calls = []
+        saved_api, saved_answer = tg.api, tg.answer_press
+        box = list(updates)
+
+        def fake_api(token, method, payload, timeout=30):
+            calls.append(method)
+            if method == "getUpdates":
+                out, box[:] = list(box), []
+                return out
+            return {}
+
+        tg.api = fake_api
+        tg.answer_press = lambda *a, **k: calls.append("answer")
+        try:
+            return tg.wait("t", "111", time.time() + 1.5, rid=rid), calls
+        finally:
+            tg.api, tg.answer_press = saved_api, saved_answer
+
+    def test_orphan_press_is_closed(self):
+        """Нажатие, которого никто не ждёт, нужно закрыть, а не копить."""
+        (kind, _data), calls = self.run_wait(
+            [self.press_update("ffff0000")], rid="aaaa1111")
+        self.assertIsNone(kind)
+        self.assertIn("editMessageReplyMarkup", calls)
+        self.assertFalse((tg.STATE_DIR / "cb-ffff0000.json").exists(),
+                         "осиротевшее нажатие не кладём на полочку")
+
+    def test_press_for_live_question_goes_to_mailbox(self):
+        """А вот нажатие для живого запроса обязано дойти до адресата."""
+        tg.pending_put("ffff0000", 111, 7, "вопрос")
+        (kind, _data), calls = self.run_wait(
+            [self.press_update("ffff0000")], rid="aaaa1111")
+        self.assertIsNone(kind)
+        self.assertNotIn("editMessageReplyMarkup", calls)
+        self.assertTrue((tg.STATE_DIR / "cb-ffff0000.json").exists())
+
     def test_session_cache(self):
         key = ap.session_key("Bash", {"command": "git push origin main"})
         self.assertFalse(tg.session_allowed("s1", key))

@@ -203,8 +203,10 @@ def main():
     # только если человек действительно что-то написал.
     message_id = (sent or {}).get("message_id")
     tg.prepare_state_dir()
+    tg.pending_put(rid, chat_id, message_id, head + "\n" + body)
     kind, data = tg.wait(token, chat_id, time.time() + wait_for,
                          rid=rid, want_text=True, reply_to=message_id)
+    tg.pending_drop(rid)
     if kind == "press":
         # Нажали «Не жди меня» — завершаем ход сразу, не тратя окно впустую.
         tg.answer_press(token, data.get("callback_id"), "Хорошо, не жду")
