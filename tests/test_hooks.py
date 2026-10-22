@@ -274,6 +274,69 @@ class EnvTest(unittest.TestCase):
         self.assertFalse(tg.enabled({"TG_TOKEN": "t"}), "без chat_id — выключено")
         self.assertFalse(tg.enabled({}), "без настроек — выключено")
 
+    def test_switch_writes_env(self):
+        """Переключатель правит ровно одну строку и не трогает остальное."""
+        import tempfile as tf
+        with tf.NamedTemporaryFile("w", suffix=".env", delete=False,
+                                   encoding="utf-8") as fh:
+            fh.write("TG_TOKEN=abc\nCC_TG_ENABLED=1\nCC_TG_QUIET=23:00-08:00\n")
+            path = fh.name
+        saved = tg.ENV_PATH
+        tg.ENV_PATH = Path(path)
+        try:
+            self.assertTrue(tg.set_enabled(False))
+            body = Path(path).read_text(encoding="utf-8")
+            self.assertIn("CC_TG_ENABLED=0", body)
+            self.assertIn("TG_TOKEN=abc", body)
+            self.assertIn("CC_TG_QUIET=23:00-08:00", body)
+            tg.set_enabled(True)
+            self.assertIn("CC_TG_ENABLED=1",
+                          Path(path).read_text(encoding="utf-8"))
+        finally:
+            tg.ENV_PATH = saved
+            os.unlink(path)
+
+    def test_switch_appends_when_key_missing(self):
+        import tempfile as tf
+        with tf.NamedTemporaryFile("w", suffix=".env", delete=False,
+                                   encoding="utf-8") as fh:
+            fh.write("TG_TOKEN=abc\n")
+            path = fh.name
+        saved = tg.ENV_PATH
+        tg.ENV_PATH = Path(path)
+        try:
+            tg.set_enabled(False)
+            self.assertIn("CC_TG_ENABLED=0",
+                          Path(path).read_text(encoding="utf-8"))
+        finally:
+            tg.ENV_PATH = saved
+            os.unlink(path)
+
+    def test_commands_recognised(self):
+        sent, saved_send, saved_env = [], tg.send, tg.ENV_PATH
+        import tempfile as tf
+        with tf.NamedTemporaryFile("w", suffix=".env", delete=False,
+                                   encoding="utf-8") as fh:
+            fh.write("TG_TOKEN=t\nTG_CHAT_ID=1\nCC_TG_ENABLED=1\n")
+            path = fh.name
+        tg.ENV_PATH = Path(path)
+        tg.send = lambda token, chat, text, **k: sent.append(text)
+        try:
+            self.assertTrue(tg.handle_command("/off", "t", "1"))
+            self.assertIn("CC_TG_ENABLED=0",
+                          Path(path).read_text(encoding="utf-8"))
+            self.assertTrue(tg.handle_command("/on", "t", "1"))
+            self.assertIn("CC_TG_ENABLED=1",
+                          Path(path).read_text(encoding="utf-8"))
+            self.assertTrue(tg.handle_command("/status", "t", "1"))
+            self.assertTrue(tg.handle_command("/чтото", "t", "1"))
+            self.assertFalse(tg.handle_command("обычный текст", "t", "1"),
+                             "обычный текст командой не считается")
+            self.assertEqual(len(sent), 4, "на каждую команду — один ответ")
+        finally:
+            tg.send, tg.ENV_PATH = saved_send, saved_env
+            os.unlink(path)
+
     def test_quiet_hours(self):
         mk = lambda h, m=0: time.struct_time((2026, 10, 21, h, m, 0, 2, 294, 0))
         self.assertTrue(tg.quiet_now("23:00-08:00", mk(23, 30)))

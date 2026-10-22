@@ -126,6 +126,11 @@ def main():
     token = env.get("TG_TOKEN", "")
     chat_id = env.get("TG_CHAT_ID", "")
     if not tg.enabled(env):
+        # Выключенный бот обязан слышать /on, иначе включить его с телефона
+        # будет нечем. Один быстрый запрос в конце хода.
+        if token and chat_id:
+            tg.prepare_state_dir()
+            tg.poll_commands(token, chat_id)
         return
 
     tg.prepare_state_dir()

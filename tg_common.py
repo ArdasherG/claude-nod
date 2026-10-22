@@ -860,6 +860,8 @@ def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
                     parsed = parse_text(message, chat_id)
                     if not parsed:
                         continue
+                    if handle_command(parsed["text"], token, chat_id):
+                        continue          # это команда, а не ответ
                     if (want_text and mine_text is None
                             and parsed.get("ts", 0) >= since - 1
                             and (not reply_to
@@ -874,3 +876,105 @@ def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
         finally:
             drop_lock()
     return None, None
+
+
+# --------------------------------------------------------------------------- #
+# Выключатель: команды из Telegram и правка .env
+# --------------------------------------------------------------------------- #
+
+ENV_PATH = HERE / ".env"
+FAIL_PATH = STATE_DIR / "poll-fail.txt"
+BACKOFF = 600           # столько молчим после неудачной попытки связи
+
+
+def set_enabled(value):
+    """Переписывает CC_TG_ENABLED в .env. Единственное место правды."""
+    line = "CC_TG_ENABLED=%d" % (1 if value else 0)
+    try:
+        text = ENV_PATH.read_text(encoding="utf-8") if ENV_PATH.exists() else ""
+        rows, done = [], False
+        for row in text.splitlines():
+            if row.strip().startswith("CC_TG_ENABLED="):
+                rows.append(line)
+                done = True
+            else:
+                rows.append(row)
+        if not done:
+            rows.append(line)
+        ENV_PATH.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return True
+    except Exception as exc:
+        debug("выключатель не записан: %s" % exc)
+        return False
+
+
+def handle_command(text, token, chat_id):
+    """Обрабатывает /on, /off, /status. True — это была команда."""
+    word = (text or "").strip().split(" ")[0].split("@")[0].lower()
+    if not word.startswith("/"):
+        return False
+    env = read_env()
+    now = enabled(env)
+
+    if word in ("/on", "/start"):
+        set_enabled(True)
+        answer = ("✅ Включён — вопросы снова приходят сюда."
+                  if not now else "✅ И так был включён.")
+    elif word == "/off":
+        set_enabled(False)
+        answer = ("🔕 Выключен — вопросы идут в терминал.\nВернуть: /on"
+                  if now else "🔕 И так был выключен.\nВернуть: /on")
+    elif word == "/status":
+        answer = "%s\nТихие часы: %s" % (
+            "✅ Включён" if now else "🔕 Выключен",
+            env.get("CC_TG_QUIET") or "не заданы")
+    else:
+        answer = "Команды: /on — включить, /off — выключить, /status — состояние"
+    try:
+        send(token, chat_id, answer, quiet=True)
+    except TgFail as exc:
+        debug("ответ на команду не ушёл: %s" % exc)
+    return True
+
+
+def poll_commands(token, chat_id, timeout=5):
+    """Короткий загляд в Telegram: ищем только команды.
+
+    Нужен, когда бот выключен: иначе включить его с телефона было бы нечем.
+    После неудачи молчим BACKOFF секунд, чтобы отсутствие сети не замедляло
+    каждый ход.
+    """
+    try:
+        if time.time() - float(FAIL_PATH.read_text(encoding="ascii")) < BACKOFF:
+            return False
+    except Exception:
+        pass
+    if not take_lock():
+        return False
+    try:
+        offset = read_offset()
+        params = {"timeout": 0, "allowed_updates": ["message"],
+                  "offset": offset if offset is not None else -1}
+        try:
+            updates = api(token, "getUpdates", params, timeout=timeout) or []
+        except TgFail as exc:
+            debug("загляд за командами не удался: %s" % exc)
+            try:
+                FAIL_PATH.write_text(str(time.time()), encoding="ascii")
+            except Exception:
+                pass
+            return False
+        try:
+            FAIL_PATH.unlink()
+        except OSError:
+            pass
+        acted = False
+        for update in updates:
+            if "update_id" in update:
+                write_offset(update["update_id"] + 1)
+            parsed = parse_text(update.get("message") or {}, chat_id)
+            if parsed and handle_command(parsed["text"], token, chat_id):
+                acted = True
+        return acted
+    finally:
+        drop_lock()
