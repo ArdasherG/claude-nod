@@ -34,6 +34,7 @@ class StateCase(unittest.TestCase):
             "STATE_DIR": tg.STATE_DIR, "LOCK_PATH": tg.LOCK_PATH,
             "OFFSET_PATH": tg.OFFSET_PATH, "INBOX_PATH": tg.INBOX_PATH,
             "LOG_PATH": tg.LOG_PATH, "STICKERS_PATH": tg.STICKERS_PATH,
+            "FAIL_PATH": tg.FAIL_PATH,
         }
         tg.STATE_DIR = root
         tg.LOCK_PATH = root / "poll.lock"
@@ -41,6 +42,7 @@ class StateCase(unittest.TestCase):
         tg.INBOX_PATH = root / "text-inbox.json"
         tg.LOG_PATH = root / "decisions.jsonl"
         tg.STICKERS_PATH = root / "stickers.json"
+        tg.FAIL_PATH = root / "poll-fail.txt"
 
     def tearDown(self):
         for name, value in self.saved.items():
@@ -56,7 +58,8 @@ class SafelistTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.NamedTemporaryFile(
             "w", suffix=".txt", delete=False, encoding="utf-8")
-        self.tmp.write("# комментарий\ngit status\nls\npython -V\n\n")
+        self.tmp.write("# комментарий\ngit status\ngit branch\ngit diff\nls\n"
+                       "dir\npython -V\nnpm test *\n\n")
         self.tmp.close()
         self.path = Path(self.tmp.name)
 
@@ -85,6 +88,28 @@ class SafelistTest(unittest.TestCase):
         self.assertFalse(self.allowed("rm -rf dist"))
         self.assertFalse(self.allowed("cat .env"))
 
+    def test_harmless_flags_pass(self):
+        self.assertTrue(self.allowed("git branch -a"))
+        self.assertTrue(self.allowed("git diff --stat"))
+        self.assertTrue(self.allowed("dir /b"))
+
+    def test_bypasses_are_refused(self):
+        """То, что раньше проходило молча."""
+        for command in ("git branch -D main", "git branch новая",
+                        "git diff --output=C:/x.txt",
+                        "git diff --no-index /dev/null ~/.ssh/id_rsa",
+                        "git branch --delete main", "git status -C ../other",
+                        "ls ~/.ssh"):
+            self.assertFalse(self.allowed(command), command)
+        for command in ("ls (Remove-Item important.txt)",
+                        "dir {Remove-Item x}.Invoke()",
+                        "dir $env:USERPROFILE", "dir %USERPROFILE%"):
+            self.assertFalse(self.allowed(command, tool="PowerShell"), command)
+
+    def test_wildcard_line_allows_arguments(self):
+        self.assertTrue(self.allowed("npm test -- --watch src/app"))
+        self.assertFalse(self.allowed("npm test; rm x"), "цепочка всё равно запрещена")
+
     def test_only_shell_tools(self):
         self.assertFalse(self.allowed("git status", tool="Edit"))
         self.assertFalse(ap.safelisted("Write", {"file_path": "a"}, path=self.path))
@@ -106,8 +131,8 @@ class SafelistTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 class RuleTest(unittest.TestCase):
-    def rule(self, command):
-        return ap.derive_rule("Bash", {"command": command}, "C:/p")
+    def rule(self, command, tool="Bash"):
+        return ap.derive_rule(tool, {"command": command})
 
     def test_two_words(self):
         self.assertEqual(self.rule("git push origin main"), ("Bash", "git push *"))
@@ -115,26 +140,92 @@ class RuleTest(unittest.TestCase):
 
     def test_one_word_when_second_is_flag_or_path(self):
         self.assertEqual(self.rule("pytest -q"), ("Bash", "pytest *"))
-        self.assertEqual(self.rule("python script.py"), ("Bash", "python *"))
+        self.assertEqual(self.rule("make build.ninja"), ("Bash", "make *"))
 
     def test_dangerous_commands_get_no_rule(self):
         for command in ("rm -rf dist", "del x", "mv a b", "curl http://x",
                         "shutdown /s", "chmod 777 f", "RM.EXE x"):
             self.assertIsNone(self.rule(command), command)
 
+    def test_interpreters_get_no_rule(self):
+        """«python *» разрешило бы навсегда любой код."""
+        for command in ("python x.py", "python3.12 x.py", "bash deploy.sh",
+                        "node app.js", "npx something", "docker run img",
+                        "powershell -c whoami"):
+            self.assertIsNone(self.rule(command), command)
+        for command in ("Remove-Item -Recurse build", "Start-Process x"):
+            self.assertIsNone(self.rule(command, tool="PowerShell"), command)
+
+    def test_risky_subcommands_get_no_rule(self):
+        for command in ("git clean -fdx", "git reset --hard", "git rm x",
+                        "npm exec foo", "git -c x=y status"):
+            self.assertIsNone(self.rule(command), command)
+
     def test_chaining_and_odd_heads(self):
         self.assertIsNone(self.rule("git status && rm x"))
         self.assertIsNone(self.rule("./gradlew assembleDebug"))
+        self.assertIsNone(self.rule("Invoke-Expression $x", tool="PowerShell"))
         self.assertIsNone(self.rule(""))
 
-    def test_file_tools_use_folder(self):
-        tool, rule = ap.derive_rule("Edit", {"file_path": "x"}, "C:/proj")
-        self.assertEqual(tool, "Edit")
-        self.assertTrue(rule.endswith("**"))
-        self.assertIn("proj", rule)
+    def test_file_and_unknown_tools_get_no_derived_rule(self):
+        self.assertIsNone(ap.derive_rule("Edit", {"file_path": "x"}))
+        self.assertIsNone(ap.derive_rule("Task", {}))
 
-    def test_unknown_tool(self):
-        self.assertIsNone(ap.derive_rule("Task", {}, "C:/p"))
+
+class PermissionUpdateTest(unittest.TestCase):
+    """Кнопки «Всегда» и «До конца сессии» — через updatedPermissions."""
+
+    def suggest(self, *rules, **extra):
+        entry = {"type": "addRules", "behavior": "allow",
+                 "destination": "localSettings", "rules": list(rules)}
+        entry.update(extra)
+        return {"permission_suggestions": [entry]}
+
+    def test_always_goes_to_project_settings(self):
+        label, update = ap.always_update({}, "Bash", {"command": "git push origin main"})
+        self.assertEqual(label, "git push *")
+        self.assertEqual(update["type"], "addRules")
+        self.assertEqual(update["destination"], "localSettings")
+        self.assertEqual(update["rules"], [{"toolName": "Bash",
+                                            "ruleContent": "git push *"}])
+
+    def test_always_prefers_claude_suggestion(self):
+        payload = self.suggest({"toolName": "Bash", "ruleContent": "npm test"},
+                               destination="userSettings")
+        label, update = ap.always_update(payload, "Bash", {"command": "npm test"})
+        self.assertEqual(label, "npm test")
+        self.assertEqual(update["destination"], "localSettings",
+                         "навсегда — только в настройки проекта, не глобально")
+
+    def test_dangerous_suggestion_is_rejected(self):
+        for rule in ({"toolName": "Bash", "ruleContent": "rm -rf node_modules"},
+                     {"toolName": "Bash"},
+                     {"toolName": "Bash", "ruleContent": "git *"},
+                     {"toolName": "Bash", "ruleContent": "python:*"},
+                     {"toolName": "Edit"}):
+            got = ap.always_update(self.suggest(rule), "Bash", {"command": "ls"})
+            label = got[0] if got else None
+            self.assertNotEqual(label, ap.label_of(rule), rule)
+
+    def test_other_suggestion_types_ignored(self):
+        payload = {"permission_suggestions": [
+            {"type": "setMode", "mode": "bypassPermissions", "destination": "session"}]}
+        self.assertIsNone(ap.always_update(payload, "Task", {}))
+        self.assertIsNone(ap.session_update(payload, "Task", {}))
+
+    def test_session_rule_is_exact_command(self):
+        update = ap.session_update({}, "Bash", {"command": "rm -rf build"})
+        self.assertEqual(update["destination"], "session")
+        self.assertEqual(update["rules"][0]["ruleContent"], "rm -rf build")
+
+    def test_session_rule_refuses_wildcards(self):
+        self.assertIsNone(ap.session_update({}, "Bash", {"command": "ls *.py"}))
+
+    def test_session_rule_for_files_needs_suggestion(self):
+        self.assertIsNone(ap.session_update({}, "Edit", {"file_path": "a.py"}))
+        payload = self.suggest({"toolName": "Edit", "ruleContent": "a.py"})
+        self.assertEqual(ap.session_update(payload, "Edit", {})["destination"],
+                         "session")
 
 
 # --------------------------------------------------------------------------- #
@@ -332,9 +423,12 @@ class EnvTest(unittest.TestCase):
             self.assertIn("CC_TG_ENABLED=1",
                           Path(path).read_text(encoding="utf-8"))
             self.assertTrue(tg.handle_command("/status", "t", "1"))
-            self.assertTrue(tg.handle_command("/чтото", "t", "1"))
+            self.assertTrue(tg.handle_command("/help", "t", "1"))
             self.assertFalse(tg.handle_command("обычный текст", "t", "1"),
                              "обычный текст командой не считается")
+            self.assertFalse(tg.handle_command("/etc/hosts поправь", "t", "1"),
+                             "инструкция с косой чертой — не команда")
+            self.assertFalse(tg.handle_command("/чтото", "t", "1"))
             self.assertEqual(len(sent), 4, "на каждую команду — один ответ")
         finally:
             tg.send, tg.ENV_PATH, tg.LOG_PATH = saved_send, saved_env, saved_log
@@ -426,9 +520,28 @@ class StateTest(StateCase):
 
     def test_lock_of_dead_process_is_removed(self):
         tg.LOCK_PATH.write_text("999999999", encoding="ascii")
+        old = time.time() - tg.LOCK_SUSPECT - 5
+        os.utime(str(tg.LOCK_PATH), (old, old))
         self.assertFalse(tg.take_lock(), "сначала только снимаем чужой флажок")
         self.assertTrue(tg.take_lock(), "после снятия флажок свободен")
         tg.drop_lock()
+
+    def test_fresh_lock_is_not_checked_for_liveness(self):
+        """Проверка живости дорогая — свежий флажок её не вызывает."""
+        tg.LOCK_PATH.write_text("999999999", encoding="ascii")
+        calls, saved = [], tg.pid_alive
+        tg.pid_alive = lambda pid: calls.append(pid) or False
+        try:
+            self.assertFalse(tg.take_lock())
+        finally:
+            tg.pid_alive = saved
+        self.assertEqual(calls, [])
+        self.assertTrue(tg.LOCK_PATH.exists())
+
+    def test_foreign_lock_is_not_dropped(self):
+        tg.LOCK_PATH.write_text("424242", encoding="ascii")
+        tg.drop_lock()
+        self.assertTrue(tg.LOCK_PATH.exists(), "чужой флажок трогать нельзя")
 
     def test_offset_roundtrip(self):
         self.assertIsNone(tg.read_offset())
@@ -457,11 +570,20 @@ class StateTest(StateCase):
         taken = tg.inbox_take(now - 50)
         self.assertEqual(taken["text"], "новое", "старое не должно подхватываться")
 
-    def test_inbox_prefers_reply(self):
+    def test_inbox_takes_only_reply_when_waiting_for_one(self):
         now = time.time()
         tg.inbox_put({"ts": now, "text": "общее", "reply_to": None})
         tg.inbox_put({"ts": now, "text": "адресное", "reply_to": 7})
         self.assertEqual(tg.inbox_take(now - 1, reply_to=7)["text"], "адресное")
+        self.assertIsNone(tg.inbox_take(now - 1, reply_to=7),
+                          "простой текст без привязки ответом не считается")
+
+    def test_reply_for_other_session_is_not_taken(self):
+        """Две сессии ждут: ответ сессии A не должен достаться B."""
+        now = time.time()
+        tg.inbox_put({"ts": now, "text": "для A", "reply_to": 100})
+        self.assertIsNone(tg.inbox_take(now - 1, reply_to=200))
+        self.assertEqual(tg.inbox_take(now - 1, reply_to=100)["text"], "для A")
 
     def test_pending_roundtrip(self):
         tg.pending_put("abcd1234", 111, 7, "текст вопроса")
@@ -552,22 +674,51 @@ class StateTest(StateCase):
         self.assertNotIn("editMessageReplyMarkup", calls)
         self.assertTrue((tg.STATE_DIR / "cb-ffff0000.json").exists())
 
-    def test_session_cache(self):
-        key = ap.session_key("Bash", {"command": "git push origin main"})
-        self.assertFalse(tg.session_allowed("s1", key))
-        tg.session_allow("s1", key)
-        self.assertTrue(tg.session_allowed("s1", key))
-        self.assertFalse(tg.session_allowed("s2", key), "сессии не делят кэш")
-
-    def test_session_key_normalises(self):
-        a = ap.session_key("Bash", {"command": "git   PUSH  origin main"})
-        b = ap.session_key("Bash", {"command": "git push origin main"})
-        self.assertEqual(a, b)
-        self.assertNotEqual(a, ap.session_key("Bash", {"command": "git pull"}))
-
-    def test_session_id_cannot_escape_folder(self):
-        path = tg.session_path("../../злой")
+    def test_state_file_cannot_escape_folder(self):
+        path = tg.state_file("followup", "../../злой")
         self.assertEqual(path.parent, tg.STATE_DIR)
+
+    def test_state_dir_is_not_shared_temp(self):
+        """Файл с нажатием равносилен нажатию — общей временной папке не место."""
+        shipped = Path(self.saved["STATE_DIR"])
+        temp = Path(os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp")
+        if not os.environ.get("CC_TG_STATE_DIR"):
+            self.assertNotEqual(shipped.parent, temp)
+            self.assertIn(".claude", shipped.parts)
+
+    def test_wait_does_not_spin_on_empty_queue(self):
+        """Без offset.txt и с пустой очередью — не тысячи запросов в секунду."""
+        calls, saved = [], tg.api
+        tg.api = lambda token, method, payload, timeout=30: calls.append(
+            payload.get("timeout")) or []
+        try:
+            tg.wait("t", "1", time.time() + 1.5, rid="aaaa1111")
+        finally:
+            tg.api = saved
+        self.assertLess(len(calls), 10, "запросов: %d" % len(calls))
+        self.assertEqual(tg.read_offset(), 0, "после пустого ответа — обычный опрос")
+
+    def test_wait_takes_only_reply_and_hints_once(self):
+        """Текст без «Ответить» не принимается, а человеку подсказывают как."""
+        sent, saved_api, saved_send = [], tg.api, tg.send
+        box = [[{"update_id": 9, "message": {
+            "message_id": 50, "from": {"id": "1"}, "date": time.time() + 1,
+            "text": "просто текст"}}]]
+
+        def fake(token, method, payload, timeout=30):
+            return box.pop() if box else []
+
+        tg.api = fake
+        tg.send = lambda token, chat, text, **k: sent.append(text)
+        tg.write_offset(1)
+        try:
+            kind, _ = tg.wait("t", "1", time.time() + 1.5, want_text=True,
+                              reply_to=777)
+        finally:
+            tg.api, tg.send = saved_api, saved_send
+        self.assertIsNone(kind)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Ответить", sent[0])
 
     def test_log_is_one_line_per_record(self):
         tg.log({"via": "test", "detail": "раз"})
@@ -667,6 +818,8 @@ class StickerTest(StateCase):
         self.assertEqual(ap.sticker_for_request("Write", {}), "ask_write")
         self.assertEqual(ap.sticker_for_request("WebFetch", {}), "ask_net")
         self.assertEqual(ap.sticker_for_request("Task", {}), "ask_other")
+        self.assertEqual(ap.sticker_for_request(
+            "PowerShell", {"command": "Remove-Item -Recurse x"}), "ask_danger")
 
 
 # --------------------------------------------------------------------------- #
@@ -696,11 +849,36 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(decision["behavior"], "deny")
         self.assertEqual(decision["message"], "нельзя")
 
-    def test_allow_with_rule(self):
-        out = json.loads(self.capture(ap.emit, "allow", rule=("Bash", "git push *")))
-        rule = out["hookSpecificOutput"]["decision"]["addPermissionRule"]
-        self.assertEqual(rule, {"tool": "Bash", "rule": "git push *",
-                                "mode": "allow"})
+    def test_allow_with_permission_update(self):
+        """Формат из документации хуков: updatedPermissions, не addPermissionRule."""
+        update = {"type": "addRules", "behavior": "allow",
+                  "destination": "localSettings",
+                  "rules": [{"toolName": "Bash", "ruleContent": "git push *"}]}
+        out = json.loads(self.capture(ap.emit, "allow", updates=update))
+        decision = out["hookSpecificOutput"]["decision"]
+        self.assertNotIn("addPermissionRule", decision)
+        self.assertEqual(decision["updatedPermissions"], [update])
+
+    def test_decision_survives_failed_message_edit(self):
+        """Сбой правки сообщения раньше съедал уже принятое решение."""
+        def fake(token, method, payload, timeout=30):
+            if method == "editMessageText":
+                raise tg.TgFail(400, "message is not modified")
+            return {}
+
+        ask = ap.Ask(token="t", chat_id="1", chat=1, msg=5, rid="aaaa1111",
+                     text="вопрос", base={}, detail="d", started=time.time(),
+                     always=None, session_rule=None)
+        saved_api, saved_log = tg.api, tg.log
+        tg.api, tg.log = fake, (lambda record: None)
+        try:
+            out = self.capture(ap.finish, ask, "allow", "✅", "allowed", "telegram",
+                               press={"callback_id": "c", "chat_id": 1,
+                                      "message_id": 5})
+        finally:
+            tg.api, tg.log = saved_api, saved_log
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["decision"],
+                         {"behavior": "allow"})
 
     def test_output_is_pure_ascii(self):
         """Иначе вывод ломается в консолях с не-UTF8 кодировкой."""
@@ -715,7 +893,7 @@ class ContractTest(unittest.TestCase):
         self.assertIn("systemMessage", out)
 
     def test_keyboard_callback_data_fits_telegram_limit(self):
-        rule = ("Bash", "git push *")
+        rule = "git push *"
         for with_session in (True, False):
             rows = ap.keyboard_for("abcd1234", rule, with_session)
             for row in rows:
@@ -731,7 +909,7 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(sorted(actions), ["a", "d", "x"])
 
     def test_keyboard_with_everything(self):
-        rows = ap.keyboard_for("abcd1234", ("Bash", "git *"), True)
+        rows = ap.keyboard_for("abcd1234", "git push *", True)
         actions = [b["callback_data"].split(":")[0] for row in rows for b in row]
         self.assertEqual(sorted(actions), ["a", "d", "r", "s", "x"])
 
@@ -792,6 +970,37 @@ class MessageTest(unittest.TestCase):
         huge = "x" * 50000
         text = ap.build_text(self.payload(tool_input={"command": huge}), "abcd1234")
         self.assertLessEqual(len(text), tg.TG_LIMIT)
+
+    def test_big_edit_stays_valid_html(self):
+        """Раньше обрезка резала внутри <pre>, и Telegram отвергал вопрос."""
+        line = ("значение = вызов_функции(аргумент_один, аргумент_два) "
+                "# длинный комментарий к строке кода ")
+        big = "\n".join(line + str(i) for i in range(8))
+        text = ap.build_text(self.payload(
+            tool_name="MultiEdit",
+            tool_input={"file_path": "a.py",
+                        "edits": [{"old_string": big, "new_string": big}] * 3}),
+            "abcd1234")
+        self.assertLessEqual(len(text), tg.CHUNK)
+        self.assertEqual(text.count("<pre>"), text.count("</pre>"))
+        self.assertIn("a.py", text, "главное — путь — остаётся всегда")
+        self.assertIn("сокращено", text)
+
+    def test_secrets_are_masked_in_command(self):
+        text = ap.build_text(self.payload(tool_input={
+            "command": "curl -H 'Authorization: Bearer abcdefghijklmnop123' "
+                       "https://x?api_key=SECRETVALUE123"}), "abcd1234")
+        self.assertNotIn("abcdefghijklmnop123", text)
+        self.assertNotIn("SECRETVALUE123", text)
+
+    def test_env_file_content_is_hidden(self):
+        text = ap.build_text(self.payload(
+            tool_name="Write",
+            tool_input={"file_path": r"C:\proj\.env",
+                        "content": "DB_HOST=localhost\nSOMETHING=value"}),
+            "abcd1234")
+        self.assertNotIn("localhost", text)
+        self.assertIn("скрыто", text)
 
     def test_tool_detail_for_various_tools(self):
         self.assertEqual(ap.tool_detail("Bash", {"command": "ls"}), "ls")
@@ -891,6 +1100,131 @@ class SessionTest(unittest.TestCase):
         notes = ss.problems({"TG_TOKEN": "t", "TG_CHAT_ID": "1"},
                             {"permission_mode": "что-то новое"})
         self.assertEqual(notes, [])
+
+
+# --------------------------------------------------------------------------- #
+# Исправленные баги и уязвимости разбора от 16.11.2026
+# --------------------------------------------------------------------------- #
+
+class MarkupFixTest(unittest.TestCase):
+    def test_chunks_keep_every_tag_balanced(self):
+        """Раньше рвался <b>: часть сообщения не уходила вовсе."""
+        md = "Начало **" + ("жирный текст " * 400) + "** конец *курсив* `код`"
+        for part in tg.chunks(tg.md_to_html(md), 1500):
+            for name in ("b", "pre", "code", "i"):
+                self.assertEqual(part.count("<%s>" % name),
+                                 part.count("</%s>" % name), (name, part[:60]))
+
+    def test_chunks_do_not_split_entity(self):
+        parts = tg.chunks("x" * 3298 + "&amp;" + "y" * 400, 3500)
+        for part in parts:
+            self.assertNotRegex(part, r"&[a-z]{0,4}$", "сущность разрезана")
+        self.assertIn("&amp;", "".join(parts))
+
+    def test_link_with_quote_is_valid(self):
+        out = tg.md_to_html('[x](https://e.com/a"b)')
+        self.assertIn('href="https://e.com/a&quot;b"', out)
+
+    def test_plain_strips_markup(self):
+        self.assertEqual(tg.plain("<b>a &amp; b</b>"), "a & b")
+
+    def test_send_falls_back_to_plain_text(self):
+        """Если Telegram не принял разметку — шлём простым текстом, а не теряем."""
+        calls, saved = [], tg.api
+
+        def fake(token, method, payload, timeout=30):
+            calls.append(dict(payload))
+            if payload.get("parse_mode"):
+                raise tg.TgFail(400, "can't parse entities")
+            return {"message_id": 1}
+
+        tg.api = fake
+        try:
+            tg.send("t", "1", "<b>сломанная <i>разметка</b>")
+        finally:
+            tg.api = saved
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("parse_mode", calls[1])
+        self.assertEqual(calls[1]["text"], "сломанная разметка")
+
+    def test_edit_never_raises(self):
+        saved = tg.api
+
+        def boom(*a, **k):
+            raise tg.TgFail(500, "упало")
+
+        tg.api = boom
+        try:
+            self.assertFalse(tg.edit("t", "1", 5, "текст"))
+            self.assertFalse(tg.edit_keyboard("t", "1", 5, []))
+        finally:
+            tg.api = saved
+
+
+class SecretTest(StateCase):
+    def test_known_token_formats(self):
+        for secret in ("8928902244:AAEXieh1VSHl8sFdB0V_6orFWd9TmAATyl8",
+                       "ghp_" + "a" * 36, "sk-" + "b" * 32, "AKIA" + "C" * 16):
+            self.assertNotIn(secret, tg.redact("ключ: %s конец" % secret), secret)
+
+    def test_assignments_are_masked_but_key_kept(self):
+        out = tg.redact("export API_KEY=abc123 && TG_TOKEN=xyz PASSWORD='p a s s'")
+        for value in ("abc123", "xyz", "p a s s"):
+            self.assertNotIn(value, out)
+        self.assertIn("API_KEY=", out)
+
+    def test_ordinary_text_untouched(self):
+        text = "git push origin main и CC_TG_TIMEOUT=300"
+        self.assertEqual(tg.redact(text), text)
+
+    def test_sensitive_paths(self):
+        for path in (".env", r"C:\p\.env.local", "~/.ssh/id_rsa", "cert.pem",
+                     "app/secrets.yaml", "/home/u/.netrc"):
+            self.assertTrue(tg.sensitive_path(path), path)
+        for path in ("app.py", "README.md", "environment.py"):
+            self.assertFalse(tg.sensitive_path(path), path)
+
+    def test_log_masks_secrets(self):
+        tg.log({"via": "test", "detail": "curl -H 'Authorization: Bearer "
+                                          "abcdefghijklmnop123'"})
+        self.assertNotIn("abcdefghijklmnop123",
+                         tg.LOG_PATH.read_text(encoding="utf-8"))
+        json.loads(tg.LOG_PATH.read_text(encoding="utf-8").strip())
+
+    def test_log_rotates(self):
+        saved = tg.LOG_MAX
+        tg.LOG_MAX = 100
+        try:
+            for _ in range(10):
+                tg.log({"via": "test", "detail": "x" * 30})
+        finally:
+            tg.LOG_MAX = saved
+        self.assertTrue(Path(str(tg.LOG_PATH) + ".1").exists())
+        self.assertLess(tg.LOG_PATH.stat().st_size, 400)
+
+
+class NotifyFixTest(StateCase):
+    def test_new_human_turn_resets_followup_budget(self):
+        """После трёх продолжений функция больше не умирает до конца сессии."""
+        nt.set_followup_count("s1", 3)
+        self.assertEqual(nt.followup_budget({"stop_hook_active": True}, "s1", 3), 3)
+        self.assertEqual(nt.followup_budget({"stop_hook_active": False}, "s1", 3), 0)
+        self.assertEqual(nt.followup_count("s1"), 0)
+
+    def test_silent_mode_warned_once_per_session(self):
+        payload = {"permission_mode": "auto"}
+        self.assertIn("auto", nt.mode_warning(payload, "s1"))
+        self.assertEqual(nt.mode_warning(payload, "s1"), "")
+        self.assertEqual(nt.mode_warning({"permission_mode": "default"}, "s2"), "")
+
+    def test_no_network_without_settings(self):
+        calls, saved = [], tg.api
+        tg.api = lambda *a, **k: calls.append(a) or []
+        try:
+            self.assertFalse(tg.poll_commands("", ""))
+        finally:
+            tg.api = saved
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

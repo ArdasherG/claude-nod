@@ -68,7 +68,9 @@ def poll_stickers(token, chat_id, deadline):
             continue
         try:
             offset = tg.read_offset()
-            params = {"allowed_updates": ["message"],
+            # Просим и нажатия тоже: подтверждение номера стирает из очереди всё
+            # более старое, и нажатия кнопок одобрения пропали бы бесследно.
+            params = {"allowed_updates": ["callback_query", "message"],
                       "offset": offset if offset is not None else -1,
                       "timeout": POLL if offset is not None else 0}
             try:
@@ -78,9 +80,14 @@ def poll_stickers(token, chat_id, deadline):
                 print("  Telegram: %s" % exc)
                 time.sleep(2)
                 continue
+            if offset is None and not updates:
+                tg.write_offset(0)          # пустая очередь — дальше длинный опрос
             for update in updates:
                 if "update_id" in update:
                     tg.write_offset(update["update_id"] + 1)
+                if update.get("callback_query"):
+                    tg.route_press(token, chat_id, update["callback_query"])
+                    continue
                 message = update.get("message") or {}
                 if str((message.get("from") or {}).get("id") or "") != str(chat_id):
                     continue

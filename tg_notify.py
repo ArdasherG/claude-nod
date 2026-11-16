@@ -5,7 +5,7 @@
   1. Уведомление «Claude закончил» с текстом ответа целиком (длинный ответ
      разбивается на несколько сообщений).
   2. Необязательный двусторонний канал: если в .env включено CC_TG_FOLLOWUP=1,
-     скрипт ждёт текстовый ответ из Telegram и возвращает его Claude Code как
+     скрипт ждёт ответ на своё сообщение и возвращает его Claude Code как
      причину не завершать ход. Тогда написанное с телефона становится
      следующей инструкцией.
 
@@ -27,10 +27,11 @@ ANSWER_LIMIT = 10000    # сколько символов ответа отпр�
 FOLLOWUP_WAIT = 90      # сколько секунд ждать ответ с телефона
 FOLLOWUP_MAX = 3        # сколько продолжений подряд разрешаем
 WATCHDOG_EXTRA = 20
+SILENT_MODES = ("auto", "bypasspermissions", "dontask")
 
 
 def counter_path(session_id):
-    return tg.STATE_DIR / ("followup-%s.json" % tg.session_path(session_id).stem)
+    return tg.state_file("followup", session_id)
 
 
 def followup_count(session_id):
@@ -48,6 +49,40 @@ def set_followup_count(session_id, value):
             json.dumps({"count": int(value), "ts": time.time()}), encoding="utf-8")
     except Exception as exc:
         tg.debug("счётчик продолжений не записан: %s" % exc)
+
+
+def followup_budget(payload, session_id, max_followups):
+    """Сколько продолжений уже сделано подряд в этой цепочке.
+
+    stop_hook_active=false значит, что ход начал человек, а не наше
+    продолжение: цепочка новая, счёт с нуля. Без этого после трёх
+    продолжений функция умирала до конца сессии.
+    """
+    if not payload.get("stop_hook_active"):
+        set_followup_count(session_id, 0)
+        return 0
+    return followup_count(session_id)
+
+
+def mode_warning(payload, session_id):
+    """Один раз за сессию: режим, в котором вопросы в Telegram не придут.
+
+    Хук SessionStart поле permission_mode обычно не получает, поэтому
+    предупреждать приходится отсюда.
+    """
+    mode = str(payload.get("permission_mode") or "").strip().lower()
+    if mode not in SILENT_MODES:
+        return ""
+    mark = tg.state_file("warned", session_id)
+    if mark.exists():
+        return ""
+    try:
+        mark.write_text(json.dumps({"mode": mode, "ts": time.time()}),
+                        encoding="utf-8")
+    except Exception:
+        pass
+    return ("\n⚠️ Режим «%s» ничего не спрашивает — вопросы о разрешениях "
+            "сюда не придут. Нужен default (Shift+Tab)." % tg.esc(mode))
 
 
 def last_answer(payload):
@@ -125,6 +160,9 @@ def main():
     env = tg.read_env()
     token = env.get("TG_TOKEN", "")
     chat_id = env.get("TG_CHAT_ID", "")
+    if not token or not chat_id:
+        return                             # без настроек — ни одного запроса в сеть
+
     # Команды слушаем в конце каждого хода, в любом состоянии: иначе /off
     # прочитать некому, пока никто не ждёт ответа, а /on — пока бот выключен.
     tg.prepare_state_dir()
@@ -133,23 +171,25 @@ def main():
     if not tg.enabled(env):
         return
 
-    tg.prepare_state_dir()
     # Хук Stop срабатывает сразу после ответа в терминале — удобный момент,
     # чтобы убрать кнопки у вопросов, на которые ответили мимо Telegram.
     tg.sweep_pending(token)
 
-    quiet = tg.quiet_now(env.get("CC_TG_QUIET"))
-    followup_on = tg.flag(env, "CC_TG_FOLLOWUP", False) and not quiet
+    # Тихие часы — это тишина целиком, а не «без звука».
+    if tg.quiet_now(env.get("CC_TG_QUIET")):
+        return
+
+    followup_on = tg.flag(env, "CC_TG_FOLLOWUP", False)
     wait_for = tg.number(env, "CC_TG_FOLLOWUP_WAIT", FOLLOWUP_WAIT, low=10, high=600)
     # Не ждём дольше, чем Claude Code готов терпеть хук: иначе он оборвёт нас
     # на полуслове и ваш ответ пропадёт. Лимит берём из его же настроек.
-    limit = tg.hook_timeout(HOOK_EVENT)
-    if limit and wait_for > limit - WATCHDOG_EXTRA - 5:
-        wait_for = max(10, int(limit - WATCHDOG_EXTRA - 5))
+    hook_limit = tg.hook_timeout(HOOK_EVENT)
+    if hook_limit and wait_for > hook_limit - WATCHDOG_EXTRA - 5:
+        wait_for = max(10, int(hook_limit - WATCHDOG_EXTRA - 5))
         tg.debug("окно ожидания ужато до %d с под лимит хука %d с"
-                 % (wait_for, limit))
+                 % (wait_for, hook_limit))
     max_followups = tg.number(env, "CC_TG_FOLLOWUP_MAX", FOLLOWUP_MAX, low=0, high=20)
-    limit = tg.number(env, "CC_TG_ANSWER_LIMIT", ANSWER_LIMIT, low=0, high=40000)
+    answer_limit = tg.number(env, "CC_TG_ANSWER_LIMIT", ANSWER_LIMIT, low=0, high=40000)
 
     threading.Thread(
         target=lambda: (time.sleep((wait_for if followup_on else 15) + WATCHDOG_EXTRA),
@@ -160,15 +200,18 @@ def main():
     session_id = payload.get("session_id")
     cwd = str(payload.get("cwd") or "")
     project = os.path.basename(cwd.rstrip("\\/")) or cwd or "проект"
-    answer = last_answer(payload)
-    if limit and len(answer) > limit:
-        answer = tg.shorten(answer, limit)
+    answer = tg.redact(last_answer(payload))
+    if answer_limit and len(answer) > answer_limit:
+        answer = tg.shorten(answer, answer_limit)
 
-    done = followup_count(session_id)
+    done = followup_budget(payload, session_id, max_followups)
     can_ask = followup_on and done < max_followups
+    if followup_on and not can_ask:
+        set_followup_count(session_id, 0)  # цепочка кончилась, бюджет обновлён
 
     head = "✅ <b>%s</b> — Claude закончил в %s" % (
         tg.esc(project), time.strftime("%H:%M"))
+    head += mode_warning(payload, session_id)
     body = tg.md_to_html(answer) if answer else "<i>ответ пустой</i>"
     tail, keyboard = "", None
     rid = uuid.uuid4().hex[:8]
@@ -183,11 +226,11 @@ def main():
     stickers = tg.load_stickers()
     smode = tg.sticker_mode(env, stickers)
     tg.sticker(token, chat_id, "waiting_reply" if can_ask else "done",
-               smode, quiet=quiet, stickers=stickers)
+               smode, stickers=stickers)
 
     try:
         sent = tg.send_parts(token, chat_id, head + "\n" + body + tail,
-                             keyboard=keyboard, quiet=quiet)
+                             keyboard=keyboard)
     except tg.TgFail as exc:
         tg.debug("уведомление не отправлено: %s" % exc)
         tg.log({"tool": HOOK_EVENT, "session": session_id, "via": "notify_failed",
@@ -199,40 +242,45 @@ def main():
                 "via": "notify", "chars": len(answer)})
         return
 
-    # Ждём текст с телефона. Петли здесь быть не может: продолжение случается
-    # только если человек действительно что-то написал.
+    # Ждём ответ на наше сообщение. Петли здесь быть не может: продолжение
+    # случается только если человек действительно что-то написал.
     message_id = (sent or {}).get("message_id")
-    tg.prepare_state_dir()
     tg.pending_put(rid, chat_id, message_id, head + "\n" + body)
-    kind, data = tg.wait(token, chat_id, time.time() + wait_for,
-                         rid=rid, want_text=True, reply_to=message_id)
-    tg.pending_drop(rid)
+    started = time.time()
+    try:
+        kind, data = tg.wait(token, chat_id, time.time() + wait_for,
+                             rid=rid, want_text=True, reply_to=message_id)
+    finally:
+        tg.pending_drop(rid)
+    waited = int(time.time() - started)
+
     if kind == "press":
         # Нажали «Не жди меня» — завершаем ход сразу, не тратя окно впустую.
+        set_followup_count(session_id, 0)
+        tg.log({"tool": HOOK_EVENT, "session": session_id, "cwd": cwd,
+                "via": "notify_dismissed", "chars": len(answer), "waited": waited})
         tg.answer_press(token, data.get("callback_id"), "Хорошо, не жду")
         tg.edit(token, data.get("chat_id") or chat_id, data.get("message_id"),
                 head + "\n" + body + "\n\n⏹ <i>Продолжение не нужно</i>")
-        set_followup_count(session_id, 0)
-        tg.log({"tool": HOOK_EVENT, "session": session_id, "cwd": cwd,
-                "via": "notify_dismissed", "chars": len(answer)})
         return
     if kind != "text":
         set_followup_count(session_id, 0)          # пауза — бюджет обновляется
         tg.log({"tool": HOOK_EVENT, "session": session_id, "cwd": cwd,
-                "via": "notify_no_reply", "chars": len(answer)})
+                "via": "notify_no_reply", "chars": len(answer), "waited": waited})
         return
 
     reply = tg.clip((data.get("text") or "").strip(), 2000)
     set_followup_count(session_id, done + 1)
+    emit_continue(reply)                           # главное — сразу
+    tg.log({"tool": HOOK_EVENT, "session": session_id, "cwd": cwd,
+            "via": "followup", "reply": tg.clip(reply, 200), "step": done + 1,
+            "waited": waited})
     tg.sticker(token, chat_id, "followup_sent", smode, quiet=True, stickers=stickers)
     try:
         tg.send(token, chat_id, "▶️ <i>Передал Claude:</i>\n%s" % tg.esc(reply),
                 quiet=True)
     except tg.TgFail:
         pass
-    tg.log({"tool": HOOK_EVENT, "session": session_id, "cwd": cwd,
-            "via": "followup", "reply": tg.clip(reply, 200), "step": done + 1})
-    emit_continue(reply)
 
 
 if __name__ == "__main__":

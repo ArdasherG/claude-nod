@@ -20,22 +20,29 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 LOG_PATH = HERE / "decisions.jsonl"
-STATE_DIR = Path(
-    os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp"
-) / "cc-tg-approve"
+ENV_PATH = HERE / ".env"
+STICKERS_PATH = HERE / "stickers.json"
+
+# Состояние живёт в профиле пользователя, а не в общей временной папке:
+# файл с нажатием здесь равносилен нажатию кнопки, и класть его туда должен
+# только сам бот. На POSIX папка закрывается правами 700.
+STATE_DIR = Path(os.environ.get("CC_TG_STATE_DIR")
+                 or (Path.home() / ".claude" / "cc-tg"))
 LOCK_PATH = STATE_DIR / "poll.lock"
 OFFSET_PATH = STATE_DIR / "offset.txt"
 INBOX_PATH = STATE_DIR / "text-inbox.json"
+FAIL_PATH = STATE_DIR / "poll-fail.txt"
 
 TG_LIMIT = 4096         # предел Telegram на одно сообщение
 CHUNK = 3500            # с запасом на служебные строки и теги
 LONG_POLL = 20          # максимум секунд на один вопрос к Telegram
-LOCK_STALE = 60         # через столько секунд брошенный флажок снимается
+LOCK_STALE = 60         # через столько секунд флажок снимается в любом случае
+LOCK_SUSPECT = 25       # после стольких секунд проверяем, жив ли владелец
 MAILBOX_TTL = 600       # через столько секунд чужие нажатия вычищаются
 INBOX_TTL = 300         # столько живёт непрочитанное текстовое сообщение
-SESSION_TTL = 86400     # столько живёт кэш разрешений сессии
-
-STICKERS_PATH = HERE / "stickers.json"
+SESSION_TTL = 86400     # столько живут счётчики и пометки сессий
+BACKOFF = 600           # столько молчим после неудачной попытки связи
+LOG_MAX = 1000000       # после этого размера журнал уходит в .1
 
 ENV_KEYS = (
     "TG_TOKEN", "TG_CHAT_ID", "CC_TG_TIMEOUT", "CC_TG_DEBUG", "CC_TG_QUIET",
@@ -59,11 +66,20 @@ STICKER_EVENTS = (
 )
 STICKER_KINDS = dict(STICKER_EVENTS)
 
+# Команды из чата. Только эти слова считаются командами: текст вроде
+# «/etc/hosts поправь» — обычная инструкция, а не неизвестная команда.
+COMMANDS = {
+    "/on": "/on", "/start": "/on", "/вкл": "/on", "/включить": "/on",
+    "/off": "/off", "/выкл": "/off", "/выключить": "/off",
+    "/status": "/status", "/статус": "/status", "/состояние": "/status",
+    "/help": "/help", "/помощь": "/help",
+}
+
 _DEBUG = False
 
 
 # --------------------------------------------------------------------------- #
-# Отладка и журнал
+# Отладка, журнал и маскировка секретов
 # --------------------------------------------------------------------------- #
 
 def set_debug(flag):
@@ -80,11 +96,68 @@ def debug(msg):
             pass
 
 
+MASK = "•••"
+_SECRET_PATTERNS = (
+    re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"),             # токены ботов Telegram
+    re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),             # ключи вида sk-…
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),                # GitHub
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                          # AWS
+    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),               # Slack
+    re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"),                      # Google
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?"
+               r"(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S),
+)
+_SECRET_ASSIGN = re.compile(
+    r"(?i)\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|apikey"
+    r"|access[_-]?key|private[_-]?key)[A-Za-z0-9_.-]*)"
+    r"(\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s\"',;]+)")
+_BEARER = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{12,}")
+_SENSITIVE_FILE = re.compile(
+    r"(?i)(^|[\\/])(\.env(\.[^\\/]*)?|[^\\/]*\.(pem|key|p12|pfx|keystore)"
+    r"|id_(rsa|dsa|ecdsa|ed25519)[^\\/]*|\.netrc|\.pgpass|credentials[^\\/]*"
+    r"|[^\\/]*secret[^\\/]*)$")
+
+
+def redact(text):
+    """Прячет то, что похоже на ключи, токены и пароли.
+
+    Срабатывает с запасом: лучше скрыть лишнее в превью, чем отправить
+    ключ на чужие серверы и в журнал.
+    """
+    text = str(text if text is not None else "")
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(MASK, text)
+    text = _SECRET_ASSIGN.sub(lambda m: m.group(1) + m.group(2) + MASK, text)
+    text = _BEARER.sub(lambda m: m.group(1) + MASK, text)
+    return text
+
+
+def sensitive_path(path):
+    """Файл, содержимое которого не показываем вовсе: .env, ключи и прочее."""
+    return bool(_SENSITIVE_FILE.search(str(path or "")))
+
+
+def _redact_value(value):
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list):
+        return [_redact_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _redact_value(v) for k, v in value.items()}
+    return value
+
+
 def log(record):
     """Дописывает строку в журнал решений. Молча игнорирует любые проблемы."""
     try:
-        record = dict(record)
+        record = _redact_value(dict(record))
         record["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_MAX:
+                os.replace(str(LOG_PATH), str(LOG_PATH) + ".1")
+        except OSError:
+            pass
         with open(LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:
@@ -99,9 +172,8 @@ def read_env():
     """Настройки: сначала .env рядом со скриптом, потом переменные окружения."""
     data = {}
     try:
-        path = HERE / ".env"
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
+        if ENV_PATH.exists():
+            for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
@@ -200,6 +272,11 @@ def esc(text):
     return html.escape(str(text), quote=False)
 
 
+def plain(text):
+    """HTML без тегов и сущностей — запасной вид, когда разметку не приняли."""
+    return html.unescape(re.sub(r"<[^>]+>", "", str(text or "")))
+
+
 def clip(text, limit):
     """Жёсткая обрезка с многоточием."""
     text = str(text)
@@ -259,7 +336,10 @@ def md_to_html(text):
     text = _INLINE_CODE.sub(lambda m: keep("<code>%s</code>" % esc(m.group(1))), text)
 
     text = esc(text)
-    text = _LINK.sub(lambda m: '<a href="%s">%s</a>' % (m.group(2), m.group(1)), text)
+    # Кавычку в адресе экранируем, иначе она закроет атрибут href, и Telegram
+    # отвергнет всё сообщение.
+    text = _LINK.sub(lambda m: '<a href="%s">%s</a>'
+                     % (m.group(2).replace('"', "&quot;"), m.group(1)), text)
     text = _HEADER.sub(lambda m: "<b>%s</b>" % m.group(1), text)
     text = _BOLD.sub(lambda m: "<b>%s</b>" % m.group(1), text)
     text = _BULLET.sub(lambda m: "%s• " % m.group(1), text)
@@ -269,11 +349,25 @@ def md_to_html(text):
     return text.strip()
 
 
-def chunks(text, limit=CHUNK):
-    """Режет готовый HTML на части по границам строк, не ломая <pre>.
+_TAG = re.compile(r"<(/?)(b|i|u|s|code|pre|a|blockquote)\b[^>]*>")
 
-    Если часть обрывается внутри <pre>, блок закрывается и открывается
-    заново в следующей части — иначе Telegram отвергнет разметку.
+
+def _safe_cut(line, limit):
+    """Где разрезать слишком длинную строку, не разрывая тег и сущность."""
+    cut = limit
+    if line.rfind("<", 0, cut) > line.rfind(">", 0, cut):
+        cut = line.rfind("<", 0, cut)
+    amp = line.rfind("&", 0, cut)
+    if amp > line.rfind(";", 0, cut) and cut - amp < 10:
+        cut = amp
+    return cut if cut > 0 else limit
+
+
+def chunks(text, limit=CHUNK):
+    """Режет готовый HTML на части по границам строк, не ломая разметку.
+
+    Открытые на границе теги закрываются в конце части и открываются заново
+    в начале следующей — иначе Telegram отвергнет сообщение целиком.
     """
     text = str(text or "")
     if not text.strip():
@@ -281,34 +375,44 @@ def chunks(text, limit=CHUNK):
     if len(text) <= limit:
         return [text]
 
+    budget = max(100, limit - 200)          # место под повторённые теги
     parts, current, size = [], [], 0
-    depth = 0                 # сколько <pre> открыто и ещё не закрыто
-    carry = False             # начался ли текущий кусок внутри <pre>
+    stack = []                              # открытые теги: (имя, как открыт)
+    prefix = ""
 
     def close():
-        """Закрывает набранный кусок, при необходимости достраивая <pre>."""
-        nonlocal current, size, carry
+        nonlocal current, size, prefix
         if not current:
             return
-        body = "\n".join(current)
-        if carry:
-            body = "<pre>" + body
-        if depth > 0:
-            body += "</pre>"
-        parts.append(body)
-        carry = depth > 0     # следующий кусок продолжает тот же блок
+        tail = "".join("</%s>" % name for name, _ in reversed(stack))
+        parts.append(prefix + "\n".join(current) + tail)
+        prefix = "".join(opening for _, opening in stack)
         current, size = [], 0
 
+    def track(piece):
+        for match in _TAG.finditer(piece):
+            name = match.group(2)
+            if match.group(1):
+                for index in range(len(stack) - 1, -1, -1):
+                    if stack[index][0] == name:
+                        del stack[index]
+                        break
+            else:
+                stack.append((name, match.group(0)))
+
     for raw in text.split("\n"):
-        # очень длинная строка без переносов: режем по символам
-        pieces = [raw[i:i + limit] for i in range(0, len(raw), limit)] or [""]
-        for line in pieces:
-            if current and size + len(line) + 1 > limit:
+        pieces, line = [], raw
+        while len(line) > budget:
+            cut = _safe_cut(line, budget)
+            pieces.append(line[:cut])
+            line = line[cut:]
+        pieces.append(line)
+        for piece in pieces:
+            if current and size + len(piece) + 1 > budget:
                 close()
-            current.append(line)
-            size += len(line) + 1
-            depth += line.count("<pre>") - line.count("</pre>")
-            depth = max(0, depth)
+            current.append(piece)
+            size += len(piece) + 1
+            track(piece)
     close()
     return parts
 
@@ -334,7 +438,11 @@ def api(token, method, payload, timeout=30):
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             answer = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise TgFail(exc.code, "%s -> HTTP %s" % (method, exc.code))
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("description")
+        except Exception:
+            detail = None
+        raise TgFail(exc.code, "%s -> HTTP %s %s" % (method, exc.code, detail or ""))
     except Exception as exc:
         raise TgFail(0, "%s -> %s" % (method, exc))
     if not answer.get("ok"):
@@ -343,6 +451,7 @@ def api(token, method, payload, timeout=30):
 
 
 def send(token, chat_id, text, keyboard=None, quiet=False, timeout=20):
+    """Отправляет сообщение. Если разметку не приняли — простым текстом."""
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -352,7 +461,15 @@ def send(token, chat_id, text, keyboard=None, quiet=False, timeout=20):
     }
     if keyboard:
         payload["reply_markup"] = {"inline_keyboard": keyboard}
-    return api(token, "sendMessage", payload, timeout=timeout)
+    try:
+        return api(token, "sendMessage", payload, timeout=timeout)
+    except TgFail as exc:
+        if exc.code != 400:
+            raise
+        debug("разметку не приняли (%s), шлю простым текстом" % exc)
+        payload.pop("parse_mode", None)
+        payload["text"] = clip(plain(text), TG_LIMIT - 10)
+        return api(token, "sendMessage", payload, timeout=timeout)
 
 
 def send_parts(token, chat_id, text, keyboard=None, quiet=False):
@@ -372,27 +489,51 @@ def send_parts(token, chat_id, text, keyboard=None, quiet=False):
 
 
 def edit(token, chat_id, message_id, text, timeout=15):
-    """Переписывает сообщение. reply_markup не передаём — кнопки уходят."""
+    """Переписывает сообщение и убирает кнопки. Никогда не бросает исключений.
+
+    Это всегда косметика: решение к этому моменту уже принято, и сбой правки
+    не должен его отменить. Возвращает True, если получилось.
+    """
     if not message_id:
-        return None
-    return api(token, "editMessageText", {
+        return False
+    payload = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": clip(text, TG_LIMIT - 1),
+        "text": clip(text, TG_LIMIT - 10),
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
-    }, timeout=timeout)
+    }
+    try:
+        api(token, "editMessageText", payload, timeout=timeout)
+        return True
+    except TgFail as exc:
+        if exc.code != 400 or "not modified" in str(exc):
+            debug("сообщение не переписано: %s" % exc)
+            return False
+        payload.pop("parse_mode", None)
+        payload["text"] = clip(plain(text), TG_LIMIT - 10)
+        try:
+            api(token, "editMessageText", payload, timeout=timeout)
+            return True
+        except TgFail as exc2:
+            debug("сообщение не переписано и простым текстом: %s" % exc2)
+            return False
 
 
 def edit_keyboard(token, chat_id, message_id, keyboard, timeout=15):
-    """Меняет только кнопки, текст оставляет как есть."""
+    """Меняет только кнопки. Никогда не бросает исключений."""
     if not message_id:
-        return None
-    return api(token, "editMessageReplyMarkup", {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "reply_markup": {"inline_keyboard": keyboard},
-    }, timeout=timeout)
+        return False
+    try:
+        api(token, "editMessageReplyMarkup", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": {"inline_keyboard": keyboard},
+        }, timeout=timeout)
+        return True
+    except TgFail as exc:
+        debug("кнопки не изменены: %s" % exc)
+        return False
 
 
 def upload(token, method, fields, field, filename, blob, ctype, timeout=90):
@@ -500,15 +641,22 @@ def answer_press(token, callback_id, text="", alert=False, timeout=10):
 
 
 # --------------------------------------------------------------------------- #
-# Файлы состояния: флажок, полочка, входящие тексты, кэш сессии
+# Файлы состояния: флажок, полочка, входящие тексты
 # --------------------------------------------------------------------------- #
 
 def prepare_state_dir():
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(str(STATE_DIR), 0o700)
+            except OSError:
+                pass
         now = time.time()
         for pattern, ttl in (("cb-*.json", MAILBOX_TTL),
-                             ("session-*.json", SESSION_TTL)):
+                             ("followup-*.json", SESSION_TTL),
+                             ("warned-*.json", SESSION_TTL),
+                             ("*.tmp", 60)):
             for item in STATE_DIR.glob(pattern):
                 try:
                     if now - item.stat().st_mtime > ttl:
@@ -517,6 +665,12 @@ def prepare_state_dir():
                     pass
     except Exception as exc:
         debug("рабочая папка не готова: %s" % exc)
+
+
+def state_file(prefix, ident):
+    """Путь к файлу состояния; идентификатор не может вывести за папку."""
+    safe = re.sub(r"[^0-9a-zA-Z_-]", "", str(ident or "none"))[:64] or "none"
+    return STATE_DIR / ("%s-%s.json" % (prefix, safe))
 
 
 def pid_alive(pid):
@@ -550,7 +704,12 @@ def pid_alive(pid):
 
 
 def take_lock():
-    """Берёт флажок «я опрашиваю Telegram». Брошенный флажок снимает сам."""
+    """Берёт флажок «я опрашиваю Telegram». Брошенный флажок снимает сам.
+
+    Живость владельца проверяем, только если флажок держится подозрительно
+    долго: проверка на Windows — это запуск tasklist, и делать её каждую
+    секунду на каждого ждущего слишком дорого.
+    """
     try:
         fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
@@ -560,9 +719,9 @@ def take_lock():
         return True
     except FileExistsError:
         try:
+            age = time.time() - LOCK_PATH.stat().st_mtime
             owner = LOCK_PATH.read_text(encoding="ascii").strip()
-            stale = time.time() - LOCK_PATH.stat().st_mtime > LOCK_STALE
-            if stale or not pid_alive(owner):
+            if age > LOCK_STALE or (age > LOCK_SUSPECT and not pid_alive(owner)):
                 LOCK_PATH.unlink()
                 debug("снял флажок процесса %s" % owner)
         except OSError:
@@ -574,8 +733,10 @@ def take_lock():
 
 
 def drop_lock():
+    """Снимает флажок, только если он наш: чужой трогать нельзя."""
     try:
-        LOCK_PATH.unlink()
+        if LOCK_PATH.read_text(encoding="ascii").strip() == str(os.getpid()):
+            LOCK_PATH.unlink()
     except OSError:
         pass
 
@@ -647,26 +808,19 @@ def _inbox_read():
 
 
 def inbox_take(since, reply_to=None):
-    """Забирает текстовое сообщение: ответ на наше сообщение либо самое старое.
+    """Забирает текстовое сообщение, написанное после `since`.
 
-    Сообщения старше `since` игнорируются, чтобы не подхватить чужую реплику,
-    написанную до того, как мы начали ждать.
+    Если известно, на какое сообщение ждём ответа, берём только ответ на него:
+    иначе при двух ждущих сессиях текст для одной достанется другой.
     """
     try:
         items = _inbox_read()
-        if not items:
-            return None
         fresh = [m for m in items if m.get("ts", 0) >= since]
-        picked = None
         if reply_to:
-            for m in fresh:
-                if m.get("reply_to") == reply_to:
-                    picked = m
-                    break
-        if picked is None and fresh:
-            picked = fresh[0]
-        if picked is None:
+            fresh = [m for m in fresh if m.get("reply_to") == reply_to]
+        if not fresh:
             return None
+        picked = fresh[0]
         items.remove(picked)
         _write_json(INBOX_PATH, items)
         return picked
@@ -715,49 +869,16 @@ def sweep_pending(token, note="⌨️ Решено в терминале", max_a
             # записи подчищаем в любом случае.
             if pid and pid_alive(pid) and age < max_age:
                 continue
-            try:
-                edit(token, data.get("chat_id"), data.get("message_id"),
-                     (data.get("text") or "") + "\n\n" + note)
-                debug("убрал кнопки у брошенного вопроса %s" % item.stem)
-            except TgFail as exc:
-                debug("не удалось убрать кнопки: %s" % exc)
+            edit(token, data.get("chat_id"), data.get("message_id"),
+                 (data.get("text") or "") + "\n\n" + note)
+            debug("убрал кнопки у брошенного вопроса %s" % item.stem)
             item.unlink()
     except Exception as exc:
         debug("уборка брошенных вопросов не удалась: %s" % exc)
 
 
-def session_path(session_id):
-    safe = re.sub(r"[^0-9a-zA-Z_-]", "", str(session_id or "none"))[:64]
-    return STATE_DIR / ("session-%s.json" % (safe or "none"))
-
-
-def session_allowed(session_id, key):
-    """Разрешено ли это действие до конца сессии (кнопка «⏳»)."""
-    try:
-        data = json.loads(session_path(session_id).read_text(encoding="utf-8"))
-        return key in (data.get("keys") or [])
-    except Exception:
-        return False
-
-
-def session_allow(session_id, key):
-    path = session_path(session_id)
-    try:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-        keys = data.get("keys") or []
-        if key not in keys:
-            keys.append(key)
-        _write_json(path, {"keys": keys[-200:]})
-        debug("до конца сессии разрешено: %s" % key)
-    except Exception as exc:
-        debug("кэш сессии не записан: %s" % exc)
-
-
 # --------------------------------------------------------------------------- #
-# Ожидание ответа из Telegram
+# Разбор и раздача событий из Telegram
 # --------------------------------------------------------------------------- #
 
 def parse_press(callback, chat_id, token):
@@ -798,18 +919,15 @@ def parse_text(message, chat_id):
             "message_id": message.get("message_id"), "reply_to": reply}
 
 
-def close_orphan_press(token, press, note="⌨️ Этот вопрос уже закрыт"):
+def close_orphan_press(token, press):
     """Отвечает на нажатие, которого никто не ждёт, и убирает кнопки.
 
     Так бывает, когда на вопрос ответили в терминале или хук уже завершился:
     процесса нет, отвечать некому, и Telegram бесконечно крутит спиннер.
     """
     answer_press(token, press.get("callback_id"), "Вопрос уже закрыт")
-    try:
-        edit_keyboard(token, press.get("chat_id"), press.get("message_id"), [])
+    if edit_keyboard(token, press.get("chat_id"), press.get("message_id"), []):
         debug("закрыл осиротевшее нажатие")
-    except TgFail as exc:
-        debug("осиротевшее нажатие не закрыть: %s" % exc)
 
 
 def is_pending(rid):
@@ -820,6 +938,31 @@ def is_pending(rid):
         return False
 
 
+def route_press(token, chat_id, callback, rid=None):
+    """Раздаёт нажатие: своё — вернуть, чужое — на полочку, ничьё — закрыть."""
+    got, press = parse_press(callback, chat_id, token)
+    if not got:
+        return None
+    if rid and got == rid:
+        return press
+    if is_pending(got):
+        mailbox_put(got, press)
+    else:
+        close_orphan_press(token, press)
+    return None
+
+
+def hint_reply(token, chat_id):
+    """Подсказывает, что текст нужно отправить ответом на нужное сообщение."""
+    try:
+        send(token, chat_id,
+             "↩️ Чтобы я понял, к какому вопросу это относится, ответьте "
+             "на нужное сообщение: зажмите его и выберите «Ответить».",
+             quiet=True)
+    except TgFail as exc:
+        debug("подсказка не ушла: %s" % exc)
+
+
 def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
          since=None):
     """Ждёт нажатие кнопки с номером `rid` и/или текстовый ответ.
@@ -827,8 +970,10 @@ def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
     Возвращает ("press", данные) | ("text", данные) | (None, None) по таймауту.
     К Telegram в один момент обращается только один процесс (флажок);
     чужие нажатия он раскладывает по полочке, тексты — во входящие.
+    Если задан `reply_to`, текстом считается только ответ на это сообщение.
     """
     since = time.time() if since is None else since
+    hinted = False
     while time.time() < deadline:
         if rid:
             press = mailbox_take(rid)
@@ -842,6 +987,8 @@ def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
         if not take_lock():
             time.sleep(1)
             continue
+        started = time.time()
+        updates = []
         try:
             left = deadline - time.time()
             if left <= 0:
@@ -861,6 +1008,8 @@ def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
                 debug("getUpdates не удался: %s" % exc)
                 time.sleep(2)
                 continue
+            if offset is None and not updates:
+                write_offset(0)        # очередь пуста — дальше обычный длинный опрос
 
             mine = None
             mine_text = None
@@ -869,47 +1018,39 @@ def wait(token, chat_id, deadline, rid=None, want_text=False, reply_to=None,
                     write_offset(update["update_id"] + 1)
                 callback = update.get("callback_query")
                 if callback:
-                    got, press = parse_press(callback, chat_id, token)
-                    if not got:
-                        continue
-                    if rid and got == rid:
+                    press = route_press(token, chat_id, callback, rid)
+                    if press:
                         mine = press
-                    elif is_pending(got):
-                        mailbox_put(got, press)      # ждёт другой процесс
-                    else:
-                        close_orphan_press(token, press)
                     continue
-                message = update.get("message")
-                if message:
-                    parsed = parse_text(message, chat_id)
-                    if not parsed:
-                        continue
-                    if handle_command(parsed["text"], token, chat_id):
-                        continue          # это команда, а не ответ
-                    if (want_text and mine_text is None
-                            and parsed.get("ts", 0) >= since - 1
-                            and (not reply_to
-                                 or parsed.get("reply_to") in (None, reply_to))):
-                        mine_text = parsed
-                    else:
-                        inbox_put(parsed)
+                parsed = parse_text(update.get("message") or {}, chat_id)
+                if not parsed:
+                    continue
+                if handle_command(parsed["text"], token, chat_id):
+                    continue           # это команда, а не ответ
+                if (want_text and mine_text is None
+                        and parsed.get("ts", 0) >= since - 1
+                        and (not reply_to or parsed.get("reply_to") == reply_to)):
+                    mine_text = parsed
+                    continue
+                inbox_put(parsed)
+                if want_text and reply_to and not parsed.get("reply_to") and not hinted:
+                    hinted = True
+                    hint_reply(token, chat_id)
             if mine:
                 return "press", mine
             if mine_text:
                 return "text", mine_text
         finally:
             drop_lock()
+        # Telegram ответил мгновенно и пусто — не крутим цикл вхолостую.
+        if not updates and time.time() - started < 0.5:
+            time.sleep(0.5)
     return None, None
 
 
 # --------------------------------------------------------------------------- #
 # Выключатель: команды из Telegram и правка .env
 # --------------------------------------------------------------------------- #
-
-ENV_PATH = HERE / ".env"
-FAIL_PATH = STATE_DIR / "poll-fail.txt"
-BACKOFF = 600           # столько молчим после неудачной попытки связи
-
 
 def set_enabled(value):
     """Переписывает CC_TG_ENABLED в .env. Единственное место правды."""
@@ -933,26 +1074,23 @@ def set_enabled(value):
 
 
 def handle_command(text, token, chat_id):
-    """Обрабатывает /on, /off, /status. True — это была команда."""
+    """Обрабатывает /on, /off, /status, /help. True — это была команда."""
     word = (text or "").strip().split(" ")[0].split("@")[0].lower()
-    if not word.startswith("/"):
+    command = COMMANDS.get(word)
+    if not command:
         return False
     env = read_env()
     now = enabled(env)
 
-    word = {"/вкл": "/on", "/включить": "/on", "/выкл": "/off",
-            "/выключить": "/off", "/статус": "/status",
-            "/состояние": "/status"}.get(word, word)
-
-    if word in ("/on", "/start"):
+    if command == "/on":
         set_enabled(True)
         answer = ("✅ Включён — вопросы снова приходят сюда."
                   if not now else "✅ И так был включён.")
-    elif word == "/off":
+    elif command == "/off":
         set_enabled(False)
         answer = ("🔕 Выключен — вопросы идут в терминал.\nВернуть: /on"
                   if now else "🔕 И так был выключен.\nВернуть: /on")
-    elif word == "/status":
+    elif command == "/status":
         answer = "%s\nТихие часы: %s" % (
             "✅ Включён" if now else "🔕 Выключен",
             env.get("CC_TG_QUIET") or "не заданы")
@@ -962,7 +1100,7 @@ def handle_command(text, token, chat_id):
                   "/off или /выкл — выключить\n"
                   "/status или /статус — состояние\n\n"
                   "Косая черта обязательна: без неё это обычный текст.")
-    log({"tool": "command", "via": "command", "command": word,
+    log({"tool": "command", "via": "command", "command": command,
          "enabled_before": now, "enabled_after": enabled(read_env())})
     try:
         send(token, chat_id, answer, quiet=True)
@@ -972,12 +1110,14 @@ def handle_command(text, token, chat_id):
 
 
 def poll_commands(token, chat_id, timeout=5):
-    """Короткий загляд в Telegram: ищем только команды.
+    """Короткий загляд в Telegram в конце хода.
 
-    Нужен, когда бот выключен: иначе включить его с телефона было бы нечем.
-    После неудачи молчим BACKOFF секунд, чтобы отсутствие сети не замедляло
-    каждый ход.
+    Выполняет команды и раскладывает остальное по местам. Нужен, потому что
+    иначе команду прочитать некому, пока ни один хук не ждёт ответа. После
+    неудачи молчим BACKOFF секунд, чтобы отсутствие сети не замедляло ход.
     """
+    if not token or not chat_id:
+        return False
     try:
         if time.time() - float(FAIL_PATH.read_text(encoding="ascii")) < BACKOFF:
             return False
@@ -1004,17 +1144,15 @@ def poll_commands(token, chat_id, timeout=5):
             FAIL_PATH.unlink()
         except OSError:
             pass
+        if offset is None and not updates:
+            write_offset(0)
         acted = False
         for update in updates:
             if "update_id" in update:
                 write_offset(update["update_id"] + 1)
             callback = update.get("callback_query")
             if callback:
-                got, press = parse_press(callback, chat_id, token)
-                if got and is_pending(got):
-                    mailbox_put(got, press)      # ждёт живой процесс
-                elif got:
-                    close_orphan_press(token, press)
+                route_press(token, chat_id, callback)
                 continue
             parsed = parse_text(update.get("message") or {}, chat_id)
             if not parsed:

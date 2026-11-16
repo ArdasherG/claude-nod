@@ -1,7 +1,7 @@
 # Секреты и локальное состояние
 .env
 stickers.json
-decisions.jsonl
+decisions.jsonl*
 
 # Исходные листы со стикерами — тяжёлые, в репозитории лежит только нарезка
 stiker_pack/*.png
